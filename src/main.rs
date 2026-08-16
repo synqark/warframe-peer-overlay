@@ -10,7 +10,7 @@ use eframe::egui::{
     Stroke, TextFormat, ViewportBuilder, text::LayoutJob,
 };
 use warframe_peer_overlay::{
-    monitor::{self, MonitorSnapshot, PeerView},
+    monitor::{self, MonitorSnapshot, PeerView, WindowRect},
     notify,
     single_instance::SingleInstance,
     tray,
@@ -25,6 +25,19 @@ const OVERLAY_HEIGHT: f32 = 50.0;
 const REFERENCE_WINDOW_HEIGHT: f32 = 1440.0;
 const MIN_UI_SCALE: f32 = 0.2;
 const MAX_UI_SCALE: f32 = 4.0;
+
+/// Widest the location line is allowed to be before it starts scrolling instead of growing
+/// the peer card. Like every other size here it is in reference-scale points, so it is meant
+/// to be tuned by hand against a 2560x1440 client area.
+const LOCATION_MAX_WIDTH: f32 = 200.0;
+const LOCATION_COLOR: Color32 = Color32::from_rgb(190, 198, 210);
+/// Reference-scale points the location line travels per second while scrolling.
+const MARQUEE_SPEED: f32 = 15.0;
+/// Seconds the location line rests at the start and again at the end of its travel.
+const MARQUEE_DWELL: f64 = 2.0;
+/// The overlay otherwise repaints twice a second, which would turn the marquee into a
+/// slideshow; while any line is scrolling it asks for 10 fps instead.
+const MARQUEE_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 
 fn main() -> eframe::Result {
     // Held for the whole process: dropping it would free the name for a second instance.
@@ -70,9 +83,11 @@ fn main() -> eframe::Result {
             Ok(Box::new(OverlayApp {
                 updates: monitor::spawn(geo_enabled),
                 snapshot: None,
+                cards: Vec::new(),
                 geo_enabled,
                 rendered_once: false,
                 native_window_configured: false,
+                applied_rect: None,
                 visible: false,
                 startup_notice_pending: true,
             }))
@@ -83,9 +98,15 @@ fn main() -> eframe::Result {
 struct OverlayApp {
     updates: Receiver<MonitorSnapshot>,
     snapshot: Option<MonitorSnapshot>,
+    /// Rebuilt only when a snapshot arrives: decoding the flag SVGs and building the layout
+    /// jobs every frame would be wasteful now that the marquee raises the repaint rate.
+    cards: Vec<PeerCard>,
     geo_enabled: bool,
     rendered_once: bool,
     native_window_configured: bool,
+    /// Geometry already handed to the window, so the per-frame repositioning does not issue a
+    /// `SetWindowPos` on every one of the marquee's frames.
+    applied_rect: Option<WindowRect>,
     visible: bool,
     /// Cleared once the monitor reports for the first time, so the "waiting for Warframe"
     /// toast fires at most once per launch instead of on every quit-and-relaunch cycle.
@@ -117,6 +138,7 @@ impl eframe::App for OverlayApp {
                     let _ = notify::show("Warframe Peer Overlay", "Warframeの起動を待機中");
                 }
             }
+            self.cards = peer_cards(&snapshot.peers, self.geo_enabled);
             self.snapshot = Some(snapshot);
         }
         let context = ui.ctx().clone();
@@ -132,14 +154,20 @@ impl eframe::App for OverlayApp {
             // egui-winit applies to viewport commands once the new zoom takes effect.
             let scale = ui_scale(window_rect.height);
             context.set_pixels_per_point(scale);
-            let width = window_rect.width as f32 / scale;
-            let left = window_rect.left as f32 / scale;
-            let top = window_rect.bottom as f32 / scale - OVERLAY_HEIGHT;
-            context.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                width,
-                OVERLAY_HEIGHT,
-            )));
-            context.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(left, top)));
+            // egui-winit turns each of these into an unconditional `SetWindowPos`, so send
+            // them only when the game window actually moved rather than on every frame.
+            if self.applied_rect != Some(window_rect) {
+                let width = window_rect.width as f32 / scale;
+                let left = window_rect.left as f32 / scale;
+                let top = window_rect.bottom as f32 / scale - OVERLAY_HEIGHT;
+                context.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                    width,
+                    OVERLAY_HEIGHT,
+                )));
+                context
+                    .send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(left, top)));
+                self.applied_rect = Some(window_rect);
+            }
         }
 
         // Only show the overlay once Warframe's window position is known, to avoid flashing
@@ -151,6 +179,9 @@ impl eframe::App for OverlayApp {
         if should_show != self.visible {
             context.send_viewport_cmd(egui::ViewportCommand::Visible(should_show));
             self.visible = should_show;
+            // Re-apply the geometry on the next frame: a window that was hidden when the
+            // commands above were processed may not have kept them.
+            self.applied_rect = None;
         }
         if !should_show {
             return;
@@ -161,10 +192,8 @@ impl eframe::App for OverlayApp {
             .as_ref()
             .is_some_and(|snapshot| snapshot.status == "EE.logを監視中");
         if monitoring {
-            if let Some(snapshot) = &self.snapshot
-                && !snapshot.peers.is_empty()
-            {
-                show_compact_peer_panel(ui, &snapshot.peers, self.geo_enabled);
+            if !self.cards.is_empty() {
+                show_compact_peer_panel(ui, &self.cards);
             }
             return;
         }
@@ -200,7 +229,7 @@ impl eframe::App for OverlayApp {
                         );
                     });
                 } else {
-                    show_centered_peers(ui, &snapshot.peers, self.geo_enabled);
+                    show_centered_peers(ui, &self.cards);
                 }
             }
         });
@@ -250,14 +279,13 @@ fn show_centered_job(ui: &mut egui::Ui, job: LayoutJob) {
 const FLAG_ICON_SIZE: f32 = 14.0;
 
 struct PeerCard {
-    flag: Option<(String, Vec<u8>)>,
+    flag: Option<(String, Arc<[u8]>)>,
     first_line: LayoutJob,
     second_line: LayoutJob,
 }
 
-fn show_compact_peer_panel(ui: &mut egui::Ui, peers: &[PeerView], geo_enabled: bool) {
-    let cards = peer_cards(peers, geo_enabled);
-    let (content_width, content_height) = peer_content_size(ui, &cards);
+fn show_compact_peer_panel(ui: &mut egui::Ui, cards: &[PeerCard]) {
+    let (content_width, content_height) = peer_content_size(ui, cards);
     let panel_width = content_width + 30.0;
     let panel_height = content_height + 6.0;
     let left_margin = ((ui.available_width() - panel_width) * 0.5).max(0.0);
@@ -275,9 +303,8 @@ fn show_compact_peer_panel(ui: &mut egui::Ui, peers: &[PeerView], geo_enabled: b
     });
 }
 
-fn show_centered_peers(ui: &mut egui::Ui, peers: &[PeerView], geo_enabled: bool) {
-    let cards = peer_cards(peers, geo_enabled);
-    let (content_width, content_height) = peer_content_size(ui, &cards);
+fn show_centered_peers(ui: &mut egui::Ui, cards: &[PeerCard]) {
+    let (content_width, content_height) = peer_content_size(ui, cards);
     let top_margin = ((ui.available_height() - content_height) * 0.5).max(0.0);
     let left_margin = ((ui.available_width() - content_width) * 0.5).max(0.0);
     ui.add_space(top_margin);
@@ -310,7 +337,8 @@ fn peer_content_size(ui: &mut egui::Ui, cards: &[PeerCard]) -> (f32, f32) {
             } else {
                 0.0
             };
-            let width = flag_width + first_line.x.max(second_line.x);
+            // The location line never widens the card past its cap: past that it scrolls.
+            let width = flag_width + first_line.x.max(second_line.x.min(LOCATION_MAX_WIDTH));
             let height = first_line.y.max(FLAG_ICON_SIZE) + second_line.y;
             egui::vec2(width, height)
         })
@@ -321,7 +349,8 @@ fn peer_content_size(ui: &mut egui::Ui, cards: &[PeerCard]) -> (f32, f32) {
     (width, height)
 }
 
-fn show_peer_cards(ui: &mut egui::Ui, cards: Vec<PeerCard>) {
+fn show_peer_cards(ui: &mut egui::Ui, cards: &[PeerCard]) {
+    let time = ui.input(|input| input.time);
     for card in cards {
         Frame::new()
             .fill(Color32::from_rgba_unmultiplied(28, 35, 46, 235))
@@ -330,25 +359,67 @@ fn show_peer_cards(ui: &mut egui::Ui, cards: Vec<PeerCard>) {
             .show(ui, |ui| {
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
-                        if let Some((uri, bytes)) = card.flag {
+                        if let Some((uri, bytes)) = &card.flag {
                             ui.add(
-                                egui::Image::from_bytes(uri, bytes)
+                                egui::Image::from_bytes(uri.clone(), bytes.clone())
                                     .fit_to_exact_size(egui::vec2(FLAG_ICON_SIZE, FLAG_ICON_SIZE)),
                             );
                         }
-                        ui.label(card.first_line);
+                        ui.label(card.first_line.clone());
                     });
-                    ui.label(card.second_line);
+                    show_location_line(ui, &card.second_line, time);
                 });
             });
     }
 }
 
-fn flag_icon_bytes(country_code: &str) -> Option<(String, Vec<u8>)> {
+/// Draws the location line inside a fixed-width window, scrolling it when the text is wider
+/// than `LOCATION_MAX_WIDTH`. The overlay is click-through, so there is no hovering or
+/// dragging to reveal the rest of the text — it has to reveal itself.
+fn show_location_line(ui: &mut egui::Ui, job: &LayoutJob, time: f64) {
+    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job.clone()));
+    let text_width = galley.size().x;
+    let view_width = text_width.min(LOCATION_MAX_WIDTH);
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(view_width, galley.size().y),
+        egui::Sense::hover(),
+    );
+    if text_width > view_width {
+        ui.ctx().request_repaint_after(MARQUEE_FRAME_INTERVAL);
+    }
+    let offset = marquee_offset(time, text_width, view_width);
+    ui.painter_at(rect).galley(
+        rect.left_top() - egui::vec2(offset, 0.0),
+        galley,
+        LOCATION_COLOR,
+    );
+}
+
+/// How far the location line has travelled left at `time` seconds. The text rests at the
+/// start for `MARQUEE_DWELL`, travels at `MARQUEE_SPEED` until its end is flush with the
+/// right edge, rests there for another `MARQUEE_DWELL`, then jumps back to the start.
+fn marquee_offset(time: f64, text_width: f32, view_width: f32) -> f32 {
+    let overflow = text_width - view_width;
+    if overflow <= 0.0 {
+        return 0.0;
+    }
+
+    let travel = f64::from(overflow) / f64::from(MARQUEE_SPEED);
+    let phase = time.rem_euclid(MARQUEE_DWELL + travel + MARQUEE_DWELL);
+    if phase <= MARQUEE_DWELL {
+        0.0
+    } else if phase >= MARQUEE_DWELL + travel {
+        overflow
+    } else {
+        ((phase - MARQUEE_DWELL) * f64::from(MARQUEE_SPEED)) as f32
+    }
+}
+
+fn flag_icon_bytes(country_code: &str) -> Option<(String, Arc<[u8]>)> {
     let data_uri = rs_grid_icons::flag_data_uri(country_code)?;
     let encoded = data_uri.strip_prefix("data:image/svg+xml;base64,")?;
     let bytes = STANDARD.decode(encoded).ok()?;
-    Some((format!("bytes://flags/{country_code}.svg"), bytes))
+    Some((format!("bytes://flags/{country_code}.svg"), bytes.into()))
 }
 
 fn peer_first_line_job(peer: &PeerView) -> LayoutJob {
@@ -408,29 +479,8 @@ fn peer_second_line_job(peer: &PeerView, geo_enabled: bool) -> LayoutJob {
             _ => "地域取得OFF".to_owned(),
         }
     };
-    let location = abbreviate_location(&location);
-    job.append(
-        &location,
-        0.0,
-        text_format(13.0, Color32::from_rgb(190, 198, 210)),
-    );
+    job.append(&location, 0.0, text_format(13.0, LOCATION_COLOR));
     job
-}
-
-fn abbreviate_location(location: &str) -> String {
-    const MAX_CHARS: usize = 34;
-    const ELLIPSIS: &str = "…";
-
-    if location.chars().count() <= MAX_CHARS {
-        return location.to_owned();
-    }
-
-    let mut shortened = location.chars().take(MAX_CHARS - 1).collect::<String>();
-    if let Some(word_end) = shortened.rfind([' ', ',']) {
-        shortened.truncate(word_end);
-    }
-    shortened.push_str(ELLIPSIS);
-    shortened
 }
 
 fn text_format(size: f32, color: Color32) -> TextFormat {
@@ -500,14 +550,34 @@ mod tests {
     }
 
     #[test]
-    fn abbreviates_locations_to_the_reference_width() {
-        let reference = "Nebraska, United States of America";
-        assert_eq!(abbreviate_location(reference), reference);
+    fn holds_scrolls_and_restarts_the_location_marquee() {
+        let view_width = LOCATION_MAX_WIDTH;
+        // One second of travel, so the phases fall on whole seconds.
+        let text_width = view_width + MARQUEE_SPEED;
+        let cycle = MARQUEE_DWELL + 1.0 + MARQUEE_DWELL;
 
-        let abbreviated =
-            abbreviate_location("England, United Kingdom of Great Britain and Northern Ireland");
-        assert!(abbreviated.ends_with('…'));
-        assert!(abbreviated.chars().count() <= reference.chars().count());
+        // Text that fits never moves, no matter how long the overlay has been up.
+        assert_eq!(marquee_offset(0.0, view_width, view_width), 0.0);
+        assert_eq!(marquee_offset(97.5, view_width, view_width), 0.0);
+
+        assert_eq!(marquee_offset(0.0, text_width, view_width), 0.0);
+        assert_eq!(marquee_offset(MARQUEE_DWELL, text_width, view_width), 0.0);
+        assert_eq!(
+            marquee_offset(MARQUEE_DWELL + 0.5, text_width, view_width),
+            MARQUEE_SPEED * 0.5
+        );
+        // Once the end of the text is flush with the right edge it stays there, then the
+        // cycle restarts at the beginning rather than scrolling back.
+        assert_eq!(
+            marquee_offset(MARQUEE_DWELL + 1.0, text_width, view_width),
+            MARQUEE_SPEED
+        );
+        assert_eq!(
+            marquee_offset(cycle - 0.1, text_width, view_width),
+            MARQUEE_SPEED
+        );
+        assert_eq!(marquee_offset(cycle, text_width, view_width), 0.0);
+        assert_eq!(marquee_offset(cycle * 3.0, text_width, view_width), 0.0);
     }
 
     #[test]
