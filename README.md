@@ -16,15 +16,18 @@ Windows上でWarframeの分隊ピア情報を表示するオーバーレイで�
 - `%LOCALAPPDATA%\Warframe\EE.log` の追尾
 - 分隊メンバー、接続先IP、ホスト候補の表示
 - 国・地域・ASN表示と、リレー/VPNの可能性があるホスティングASNの表示
-- 枠なし、透明、常時最前面の軽量ネイティブUI
-- Warframeの解像度に合わせたUI全体のスケーリング
-- 多重起動の防止と、Warframe未起動時のWindows通知
+
+[![スクリーンショット](assets/readme_overlay.png)](assets/readme_overlay.png)
 
 ## 使い方
 
 [Releases](https://github.com/synqark/warframe-peer-overlay/releases) から `warframe-peer-overlay.exe` をダウンロードして実行してください。インストールは不要です。
 
 オーバーレイは常にゲーム入力を透過し、タスクバーには表示されません。releaseビルドではコマンドプロンプトも表示されません。終了するには、Windowsのタスクトレイにあるアイコンを右クリックし、`Exit` を選択してください。
+
+
+[![スクリーンショット](assets/readme_tray.png)](assets/readme_tray.png)
+
 
 すでに起動している状態でもう一度exeを実行した場合、二重に起動せず、その旨をWindows通知で知らせて終了します。
 
