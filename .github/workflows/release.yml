@@ -1,0 +1,36 @@
+name: Release
+
+# Publishes the exe when a version tag is pushed, e.g. `git tag v0.1.0 && git push origin v0.1.0`.
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo test
+
+      - run: cargo build --release
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$env:GITHUB_REF_NAME"
+          "target/release/warframe-peer-overlay.exe"
+          --title "$env:GITHUB_REF_NAME"
+          --generate-notes
