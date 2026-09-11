@@ -9,6 +9,9 @@ pub struct Peer {
     pub matchmaking_id: String,
     pub ip: Option<String>,
     pub is_host: bool,
+    /// Size of the loadout EE.log announced when this member joined, used to find it in
+    /// the game's memory.
+    pub loadout_bytes: Option<usize>,
 }
 
 impl Platform {
@@ -49,13 +52,18 @@ pub struct LogParser {
     host_address: Regex,
     remote_player: Regex,
     voip_player: Regex,
+    squad_join: Regex,
+    build_loadout: Regex,
 
     received_ping: Regex,
     peers: Vec<Peer>,
     matchmaking_ips: HashMap<String, String>,
     ping_ips_by_name: HashMap<String, String>,
+    loadout_bytes_by_name: HashMap<String, usize>,
     host_ip: Option<String>,
     local_user: Option<String>,
+    local_platform: Platform,
+    own_builds: u64,
 }
 
 impl Default for LogParser {
@@ -80,6 +88,12 @@ impl Default for LogParser {
                 r"Net \[Info\]: VOIP: Registered remote player (.+?) \(([\d.]+):\d+\)",
             )
             .expect("valid VOIP player regex"),
+            squad_join: Regex::new(
+                r"Net \[Info\]: MatchingServiceWeb::ProcessSquadMessage received JOIN message from (.+?), loadout: (\d+) bytes",
+            )
+            .expect("valid squad JOIN regex"),
+            build_loadout: Regex::new(r"Sys \[Info\]: BuildLoadOut for (.+?)\s*$")
+                .expect("valid BuildLoadOut regex"),
             received_ping: Regex::new(
                 r"Net \[Info\]: Received ping from ([\d.]+):\d+ \((.+?) - \d+ms\)",
             )
@@ -87,8 +101,11 @@ impl Default for LogParser {
             peers: Vec::new(),
             matchmaking_ips: HashMap::new(),
             ping_ips_by_name: HashMap::new(),
+            loadout_bytes_by_name: HashMap::new(),
             host_ip: None,
             local_user: None,
+            local_platform: Platform::Unknown,
+            own_builds: 0,
         }
     }
 }
@@ -102,10 +119,22 @@ impl LogParser {
         self.local_user.as_deref()
     }
 
+    /// Our platform, as our own `AddSquadMember` line showed it.
+    pub fn local_platform(&self) -> Platform {
+        self.local_platform
+    }
+
+    /// How many times EE.log has shown our own loadout being rebuilt (`BuildLoadOut`): each
+    /// change in the arsenal, leaving it, and loading into a mission.
+    pub fn own_builds(&self) -> u64 {
+        self.own_builds
+    }
+
     pub fn clear(&mut self) {
         self.peers.clear();
         self.matchmaking_ips.clear();
         self.ping_ips_by_name.clear();
+        self.loadout_bytes_by_name.clear();
         self.host_ip = None;
     }
 
@@ -151,9 +180,31 @@ impl LogParser {
             return self.reconcile();
         }
 
+        if let Some(captures) = self.squad_join.captures(line) {
+            // Our own JOIN line names nobody and carries no loadout.
+            let bytes = captures[2].parse::<usize>().unwrap_or(0);
+            if bytes == 0 {
+                return false;
+            }
+            let (name, _) = parse_player_name(&captures[1]);
+            self.loadout_bytes_by_name.insert(name, bytes);
+            return self.reconcile();
+        }
+
+        if let Some(captures) = self.build_loadout.captures(line) {
+            let (name, _) = parse_player_name(&captures[1]);
+            if self.local_user.as_deref() == Some(name.as_str()) {
+                self.own_builds += 1;
+            }
+            return false;
+        }
+
         if let Some(captures) = self.add_squad.captures(line) {
             let (name, platform) = parse_player_name(&captures[1]);
             let matchmaking_id = captures[2].to_owned();
+            if self.local_user.as_deref() == Some(name.as_str()) {
+                self.local_platform = platform;
+            }
             if self.peers.iter().any(|peer| peer.name == name) {
                 return false;
             }
@@ -192,9 +243,11 @@ impl LogParser {
                 .cloned();
             let is_host = (ip.is_some() && ip == self.host_ip)
                 || (!has_remote_host && self.local_user.as_deref() == Some(peer.name.as_str()));
-            if peer.ip != ip || peer.is_host != is_host {
+            let loadout_bytes = self.loadout_bytes_by_name.get(&peer.name).copied();
+            if peer.ip != ip || peer.is_host != is_host || peer.loadout_bytes != loadout_bytes {
                 peer.ip = ip;
                 peer.is_host = is_host;
+                peer.loadout_bytes = loadout_bytes;
                 changed = true;
             }
         }
@@ -246,6 +299,7 @@ mod tests {
                 matchmaking_id: "abc-123".to_owned(),
                 ip: Some("203.0.113.7".to_owned()),
                 is_host: true,
+                loadout_bytes: None,
             }]
         );
     }
@@ -326,5 +380,53 @@ mod tests {
 
         assert!(!parser.peers()[0].is_host);
         assert!(parser.peers()[1].is_host);
+    }
+
+    #[test]
+    fn keeps_the_announced_loadout_size_of_each_member() {
+        let mut parser = LogParser::default();
+        // The JOIN line arrives just before the member is added to the squad.
+        parser.process_line(
+            "1 Net [Info]: MatchingServiceWeb::ProcessSquadMessage received JOIN message from Tenno\u{e001}, loadout: 30615 bytes",
+        );
+        parser.process_line("1 Net [Info]: AddSquadMember: Tenno\u{e001}, mm=peer-a, squadCount=2");
+        // Our own JOIN line names nobody and carries no loadout.
+        parser.process_line(
+            "2 Net [Info]: MatchingServiceWeb::ProcessSquadMessage received JOIN message from , loadout: 0 bytes",
+        );
+        assert_eq!(parser.peers()[0].loadout_bytes, Some(30615));
+
+        parser.process_line("3 Net [Info]: MatchingService::LeaveSquad");
+        parser.process_line("4 Net [Info]: AddSquadMember: Tenno\u{e001}, mm=peer-a, squadCount=2");
+        assert_eq!(
+            parser.peers()[0].loadout_bytes,
+            None,
+            "a new squad brings a new announcement"
+        );
+    }
+
+    #[test]
+    fn counts_rebuilds_of_our_own_loadout_only() {
+        let mut parser = LogParser::default();
+        // Before login the game builds a placeholder player's loadout.
+        parser.process_line("1 Sys [Info]: BuildLoadOut for Player");
+        parser.process_line("2 Sys [Info]: Logged in LocalTenno");
+        parser.process_line("3 Sys [Info]: BuildLoadOut for LocalTenno");
+        parser.process_line("4 Sys [Info]: BuildLoadOut for RemoteTenno");
+        parser.process_line("5 Sys [Info]: BuildLoadOut for LocalTenno");
+
+        assert_eq!(parser.own_builds(), 2);
+    }
+
+    #[test]
+    fn remembers_our_platform_across_squads() {
+        let mut parser = LogParser::default();
+        parser.process_line("1 Sys [Info]: Logged in LocalTenno");
+        parser.process_line(
+            "2 Net [Info]: AddSquadMember: LocalTenno\u{e000}, mm=local, squadCount=1",
+        );
+        parser.process_line("3 Net [Info]: MatchingService::LeaveSquad");
+
+        assert_eq!(parser.local_platform(), Platform::Pc);
     }
 }

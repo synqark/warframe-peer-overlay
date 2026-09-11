@@ -3940,6 +3940,7 @@ dependencies = [
  "egui_extras",
  "image",
  "iso_country",
+ "memchr",
  "regex",
  "reqwest",
  "rs-grid-icons",

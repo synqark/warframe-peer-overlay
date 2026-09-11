@@ -1,0 +1,5 @@
+[submodule "third_party/warframe-public-export-plus"]
+	path = third_party/warframe-public-export-plus
+	url = https://github.com/calamity-inc/warframe-public-export-plus
+	branch = senpai
+	shallow = true

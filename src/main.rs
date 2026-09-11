@@ -2,13 +2,22 @@
 // overlay. Debug builds keep the console so `cargo run` can still print panics.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::{env, fs, path::PathBuf, sync::Arc, sync::mpsc::Receiver, thread, time::Duration};
+mod loadout_window;
+
+use std::{
+    env, fs,
+    path::PathBuf,
+    sync::{Arc, atomic::Ordering, mpsc::Receiver},
+    thread,
+    time::Duration,
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use eframe::egui::{
     self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Frame, RichText,
     Stroke, TextFormat, ViewportBuilder, text::LayoutJob,
 };
+use loadout_window::LoadoutWindow;
 use warframe_peer_overlay::{
     monitor::{self, MonitorSnapshot, PeerView, WindowRect},
     notify,
@@ -75,15 +84,27 @@ fn main() -> eframe::Result {
             egui_extras::install_image_loaders(&context.egui_ctx);
             configure_fonts(&context.egui_ctx);
             configure_style(&context.egui_ctx);
+            let loadout_window = LoadoutWindow::default();
+            let show_loadouts = loadout_window.show_request();
             // The tray owns a thread of its own; see `tray` for why it cannot share this one.
             let egui_ctx = context.egui_ctx.clone();
-            tray::spawn(move || {
-                egui_ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+            tray::spawn(move |command| match command {
+                // The root viewport runs its UI even while the overlay is hidden, so the pass
+                // this repaint brings on is the one that opens the loadout window.
+                tray::Command::ShowLoadouts => {
+                    show_loadouts.store(true, Ordering::Relaxed);
+                    egui_ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
+                tray::Command::Exit => {
+                    egui_ctx
+                        .send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+                }
             });
             Ok(Box::new(OverlayApp {
                 updates: monitor::spawn(geo_enabled),
                 snapshot: None,
                 cards: Vec::new(),
+                loadout_window,
                 geo_enabled,
                 rendered_once: false,
                 native_window_configured: false,
@@ -101,6 +122,8 @@ struct OverlayApp {
     /// Rebuilt only when a snapshot arrives: decoding the flag SVGs and building the layout
     /// jobs every frame would be wasteful now that the marquee raises the repaint rate.
     cards: Vec<PeerCard>,
+    /// A window of its own, but run from this viewport's passes (see `loadout_window`).
+    loadout_window: LoadoutWindow,
     geo_enabled: bool,
     rendered_once: bool,
     native_window_configured: bool,
@@ -139,9 +162,12 @@ impl eframe::App for OverlayApp {
                 }
             }
             self.cards = peer_cards(&snapshot.peers, self.geo_enabled);
+            self.loadout_window.set_rows(snapshot.loadouts.clone());
             self.snapshot = Some(snapshot);
         }
         let context = ui.ctx().clone();
+        // Run on every pass, whether or not the overlay itself is showing.
+        self.loadout_window.show(&context);
         context.request_repaint_after(Duration::from_millis(500));
         if let Some(window_rect) = self
             .snapshot
@@ -526,6 +552,9 @@ fn configure_fonts(context: &egui::Context) {
 }
 
 fn configure_style(context: &egui::Context) {
+    // Both windows are designed dark. Left to follow a light Windows theme, egui would drop
+    // the style below and draw the loadout window's scroll bar and tooltips light.
+    context.set_theme(egui::Theme::Dark);
     let mut style = (*context.style_of(egui::Theme::Dark)).clone();
     style.visuals.dark_mode = true;
     style.visuals.panel_fill = Color32::TRANSPARENT;
