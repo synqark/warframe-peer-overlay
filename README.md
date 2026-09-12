@@ -15,15 +15,14 @@ Windows上でWarframeの分隊ピア情報を表示するオーバーレイで�
 - `Warframe.x64.exe` / `Warframe.exe` の起動検出
 - `%LOCALAPPDATA%\Warframe\EE.log` の追尾
 - 分隊メンバー、接続先IP、ホスト候補の表示
+[![スクリーンショット](assets/readme_overlay.png)](assets/readme_overlay.png)
 - 国・地域・ASN表示と、リレー/VPNの可能性があるホスティングASNの表示
 - 分隊メンバーと自分自身のロードアウト（フレームと武器、そのMOD・フォーマ・レベル、コンパニオン、ギアなど）のJSON保存。自分の分はアーセナルで装備を変えるたびに更新
 - ロードアウトウィンドウ: 自分と分隊メンバーのロードアウトを1人1枚のカードで縦に並べて表示（名前・マスタリーランク・プラットフォーム・The New War / The Old Peace のクリア状況・接続元の地域と国旗と、フレーム・プライマリ・セカンダリ・近接・コンパニオン）
-- ロードアウトウィンドウ（full）: 同じ内容を1人1枚の縦長カードで横に並べ、各装備に搭載しているMODも一覧表示
-- どちらのウィンドウでも、カードを右クリックするとそのプレイヤーのロードアウトJSON全体（画面に出していない情報も含む）をクリップボードへコピー
-
-[![スクリーンショット](assets/readme_overlay.png)](assets/readme_overlay.png)
 [![ロードアウト](assets/readme_loadout.png)](assets/readme_loadout.png)
+- ロードアウトウィンドウ（full）: 同じ内容を1人1枚の縦長カードで横に並べ、各装備に搭載しているMODも一覧表示
 [![ロードアウトフル](assets/readme_loadout_full.png)](assets/readme_loadout_full.png)
+- どちらのウィンドウでも、カードを右クリックするとそのプレイヤーのロードアウトJSON全体（画面に出していない情報も含む）をクリップボードへコピー
 
 ## 使い方
 
