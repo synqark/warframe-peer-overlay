@@ -22,6 +22,8 @@ Windows上でWarframeの分隊ピア情報を表示するオーバーレイで�
 - どちらのウィンドウでも、カードを右クリックするとそのプレイヤーのロードアウトJSON全体（画面に出していない情報も含む）をクリップボードへコピー
 
 [![スクリーンショット](assets/readme_overlay.png)](assets/readme_overlay.png)
+[![ロードアウト](assets/readme_loadout.png)](assets/readme_loadout.png)
+[![ロードアウトフル](assets/readme_loadout_full.png)](assets/readme_loadout_full.png)
 
 ## 使い方
 
