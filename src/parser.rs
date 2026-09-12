@@ -64,6 +64,7 @@ pub struct LogParser {
     local_user: Option<String>,
     local_platform: Platform,
     own_builds: u64,
+    other_builds: u64,
 }
 
 impl Default for LogParser {
@@ -106,6 +107,7 @@ impl Default for LogParser {
             local_user: None,
             local_platform: Platform::Unknown,
             own_builds: 0,
+            other_builds: 0,
         }
     }
 }
@@ -128,6 +130,13 @@ impl LogParser {
     /// change in the arsenal, leaving it, and loading into a mission.
     pub fn own_builds(&self) -> u64 {
         self.own_builds
+    }
+
+    /// How many times EE.log has shown somebody else's loadout being rebuilt. The game builds
+    /// squad members' loadouts locally too (`BuildLoadOut for <member>`), and each build leaves
+    /// a version of theirs in the game's memory, where it can pass for a fresh one of ours.
+    pub fn other_builds(&self) -> u64 {
+        self.other_builds
     }
 
     pub fn clear(&mut self) {
@@ -195,6 +204,8 @@ impl LogParser {
             let (name, _) = parse_player_name(&captures[1]);
             if self.local_user.as_deref() == Some(name.as_str()) {
                 self.own_builds += 1;
+            } else {
+                self.other_builds += 1;
             }
             return false;
         }
@@ -406,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn counts_rebuilds_of_our_own_loadout_only() {
+    fn counts_rebuilds_of_our_own_loadout_apart_from_everyone_elses() {
         let mut parser = LogParser::default();
         // Before login the game builds a placeholder player's loadout.
         parser.process_line("1 Sys [Info]: BuildLoadOut for Player");
@@ -416,6 +427,8 @@ mod tests {
         parser.process_line("5 Sys [Info]: BuildLoadOut for LocalTenno");
 
         assert_eq!(parser.own_builds(), 2);
+        // The placeholder before login and the squad member count as somebody else's.
+        assert_eq!(parser.other_builds(), 2);
     }
 
     #[test]

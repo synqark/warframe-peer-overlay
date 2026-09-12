@@ -140,7 +140,7 @@ mod tests {
     }
 
     #[test]
-    fn names_gear_mods_and_cosmetics_in_the_games_language() {
+    fn names_gear_mods_and_cosmetics() {
         assert_eq!(
             entry("/Lotus/Powersuits/Excalibur/Excalibur"),
             Entry {
@@ -151,7 +151,7 @@ mod tests {
         );
         assert_eq!(
             entry("/Lotus/Types/Game/KubrowPet/HunterKubrowPetPowerSuit").name,
-            "Sunika クブロウ"
+            "Sunika Kubrow"
         );
 
         let serration = entry("/Lotus/Upgrades/Mods/Rifle/WeaponDamageAmountMod");
@@ -159,7 +159,7 @@ mod tests {
         let merciless = entry("/Lotus/Upgrades/CosmeticEnhancers/Offensive/PrimaryDamageOnKill");
         assert_eq!(
             (merciless.kind, merciless.name),
-            (Kind::Arcane, "プライマリ マーシレス")
+            (Kind::Arcane, "Primary Merciless")
         );
         assert_eq!(
             entry("/Lotus/Upgrades/Skins/Deluxe/AlchemistDeluxeShotgunSkin").kind,

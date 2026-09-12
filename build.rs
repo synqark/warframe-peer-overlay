@@ -13,9 +13,10 @@ use std::{
 
 use serde::{Deserialize, de::DeserializeOwned};
 
-/// The language names come in: the game's own setting, so they read as they do in the arsenal.
-/// The export ships `dict.<language>.json` for fifteen of them.
-const LANGUAGE: &str = "ja";
+/// The language names come in. English, though the game here runs in Japanese: Japanese names
+/// are taller than Latin ones, which would leave the rows of a card standing at heights the
+/// cards beside it cannot match. The export ships `dict.<language>.json` for fifteen of them.
+const LANGUAGE: &str = "en";
 const EXPORT_DIR: &str = "third_party/warframe-public-export-plus";
 /// Every export a loadout draws on: warframes (with archwings and necramechs), weapons (with
 /// the parts of modular ones), companions, mods, arcanes, cosmetics, glyphs and other flavour,

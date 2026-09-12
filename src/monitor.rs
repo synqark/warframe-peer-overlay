@@ -20,7 +20,7 @@ use windows_sys::Win32::{
 
 use crate::{
     geo::{GeoInfo, GeoResolver, country_name},
-    loadout::{self, CaptureRequest, Captured, Job, Loadout, OwnRequest},
+    loadout::{self, CaptureRequest, Captured, Job, Loadout, OwnRequest, RawJson},
     parser::{LogParser, Peer},
 };
 
@@ -52,8 +52,17 @@ pub struct LoadoutView {
     pub name: String,
     pub platform: String,
     pub is_local: bool,
+    /// Whether the squad connects through this player, as `PeerView::is_host` has it.
+    pub is_host: bool,
+    /// Where the peer connects from, as resolved for its `PeerView`; empty when unknown, as
+    /// it is for ourselves and whenever `--no-geo` is passed.
+    pub country: String,
+    pub country_code: String,
+    pub region: String,
     /// `None` until captured, which for some members never happens (see README).
     pub loadout: Option<Loadout>,
+    /// The whole of what was captured, for the windows to hand out; empty until then.
+    pub json: RawJson,
 }
 
 #[derive(Clone, Debug)]
@@ -84,9 +93,10 @@ fn run(sender: Sender<MonitorSnapshot>, geo_enabled: bool) {
     let mut requested_loadouts = HashSet::<(String, usize)>::new();
     // By name and announced size, so a member who re-joins with other gear is not shown the
     // old one while the new one is looked for.
-    let mut member_loadouts = HashMap::<(String, usize), Loadout>::new();
+    let mut member_loadouts = HashMap::<(String, usize), (Loadout, RawJson)>::new();
     let mut own_loadout: Option<LoadoutView> = None;
     let mut seen_own_builds = 0;
+    let mut seen_other_builds = 0;
     let mut file_position = 0;
     let mut pending = String::new();
     let mut was_running = false;
@@ -147,6 +157,9 @@ fn run(sender: Sender<MonitorSnapshot>, geo_enabled: bool) {
             if let Some(request) = own_request(&parser, pid, &mut seen_own_builds) {
                 let _ = loadouts.send(Job::Own(request));
             }
+            if let Some(job) = others_note(&parser, pid, &mut seen_other_builds) {
+                let _ = loadouts.send(job);
+            }
         }
         for captured in captures.try_iter() {
             match captured {
@@ -154,19 +167,23 @@ fn run(sender: Sender<MonitorSnapshot>, geo_enabled: bool) {
                     name,
                     bytes,
                     loadout,
+                    json,
                 } => {
-                    member_loadouts.insert((name, bytes), loadout);
+                    member_loadouts.insert((name, bytes), (loadout, json));
                 }
                 Captured::Own {
                     name,
                     platform,
                     loadout,
+                    json,
                 } => {
                     own_loadout = Some(LoadoutView {
                         name,
                         platform,
                         is_local: true,
                         loadout: Some(loadout),
+                        json,
+                        ..LoadoutView::default()
                     });
                 }
             }
@@ -207,7 +224,7 @@ fn run(sender: Sender<MonitorSnapshot>, geo_enabled: bool) {
                 }
             })
             .collect::<Vec<_>>();
-        let loadout_cards = loadout_views(&parser, own_loadout.as_ref(), &member_loadouts);
+        let loadout_cards = loadout_views(&parser, &peers, own_loadout.as_ref(), &member_loadouts);
         let signature = format!("{running}:{status}:{peers:?}:{window_rect:?}:{loadout_cards:?}");
         if signature != last_signature {
             if sender
@@ -273,30 +290,57 @@ fn own_request(parser: &LogParser, pid: u32, seen_builds: &mut u64) -> Option<Ow
 /// the order they joined. A member whose loadout is not captured still gets a card.
 fn loadout_views(
     parser: &LogParser,
+    peers: &[PeerView],
     own: Option<&LoadoutView>,
-    members: &HashMap<(String, usize), Loadout>,
+    members: &HashMap<(String, usize), (Loadout, RawJson)>,
 ) -> Vec<LoadoutView> {
     let local_user = parser.local_user();
-    let own = own.cloned().unwrap_or_else(|| LoadoutView {
+    let mut own = own.cloned().unwrap_or_else(|| LoadoutView {
         name: local_user.unwrap_or_default().to_owned(),
         platform: parser.local_platform().label().to_owned(),
         is_local: true,
-        loadout: None,
+        ..LoadoutView::default()
     });
+    // Whoever hosts changes from squad to squad, so it is taken afresh rather than from
+    // whenever our loadout was captured.
+    own.is_host = parser
+        .peers()
+        .iter()
+        .any(|peer| Some(peer.name.as_str()) == local_user && peer.is_host);
+    // `peers` holds the `PeerView` built from this same `parser.peers()`, in that order, so
+    // zipping them lands each member's card on its own resolved location.
     let squad = parser
         .peers()
         .iter()
-        .filter(|peer| local_user != Some(peer.name.as_str()))
-        .map(|peer| LoadoutView {
-            name: peer.name.clone(),
-            platform: peer.platform.label().to_owned(),
-            is_local: false,
-            loadout: peer
+        .zip(peers)
+        .filter(|(peer, _)| local_user != Some(peer.name.as_str()))
+        .map(|(peer, view)| {
+            let captured = peer
                 .loadout_bytes
-                .and_then(|bytes| members.get(&(peer.name.clone(), bytes)))
-                .cloned(),
+                .and_then(|bytes| members.get(&(peer.name.clone(), bytes)));
+            LoadoutView {
+                name: peer.name.clone(),
+                platform: peer.platform.label().to_owned(),
+                is_local: false,
+                is_host: peer.is_host,
+                country: view.country.clone(),
+                country_code: view.country_code.clone(),
+                region: view.region.clone(),
+                loadout: captured.map(|(loadout, _)| loadout.clone()),
+                json: captured.map_or_else(RawJson::default, |(_, json)| json.clone()),
+            }
         });
     std::iter::once(own).chain(squad).collect()
+}
+
+/// The game builds squad members' loadouts locally as well, and each build leaves a version
+/// of theirs in memory. The worker is told to take note of those as soon as EE.log mentions
+/// one, so that it never mistakes a member's version for a freshly built one of ours.
+fn others_note(parser: &LogParser, pid: u32, seen_builds: &mut u64) -> Option<Job> {
+    (parser.other_builds() != *seen_builds).then(|| {
+        *seen_builds = parser.other_builds();
+        Job::Others { pid }
+    })
 }
 
 fn find_process_window_rect(process_id: u32) -> Option<WindowRect> {
@@ -449,11 +493,57 @@ mod tests {
     }
 
     #[test]
+    fn notes_another_players_rebuild_once() {
+        let mut parser = LogParser::default();
+        let mut seen = 0;
+        parser.process_line("1 Sys [Info]: Logged in LocalTenno");
+        assert_eq!(
+            others_note(&parser, 42, &mut seen),
+            None,
+            "nobody has rebuilt anything yet"
+        );
+
+        parser.process_line("2 Sys [Info]: BuildLoadOut for RemoteTenno");
+        assert_eq!(
+            others_note(&parser, 42, &mut seen),
+            Some(Job::Others { pid: 42 })
+        );
+        assert_eq!(
+            others_note(&parser, 42, &mut seen),
+            None,
+            "nothing rebuilt since"
+        );
+
+        parser.process_line("3 Sys [Info]: BuildLoadOut for LocalTenno");
+        assert_eq!(
+            others_note(&parser, 42, &mut seen),
+            None,
+            "our own rebuild is not somebody else's"
+        );
+    }
+
+    #[test]
     fn lists_our_loadout_first_then_each_member_still_in_the_squad() {
         fn cards(views: &[LoadoutView]) -> Vec<(&str, bool, bool)> {
             views
                 .iter()
                 .map(|view| (view.name.as_str(), view.is_local, view.loadout.is_some()))
+                .collect()
+        }
+
+        // What `run` hands over: one `PeerView` per parser peer, in that order, carrying
+        // whatever the geo lookup resolved for it.
+        fn peer_views(parser: &LogParser) -> Vec<PeerView> {
+            parser
+                .peers()
+                .iter()
+                .map(|peer| PeerView {
+                    name: peer.name.clone(),
+                    country: "Japan".to_owned(),
+                    country_code: "JP".to_owned(),
+                    region: "Tokyo".to_owned(),
+                    ..PeerView::default()
+                })
                 .collect()
         }
 
@@ -471,13 +561,14 @@ mod tests {
             mastery_rank: Some(5),
             ..Loadout::default()
         };
+        let json = RawJson::from(br#"{"PlayerLevel":5}"#.as_slice());
         // Lotus announced no loadout, so one captured under their name is not theirs now.
         let members = HashMap::from([
-            (("Tenno".to_owned(), 200), captured.clone()),
-            (("Lotus".to_owned(), 300), captured.clone()),
+            (("Tenno".to_owned(), 200), (captured.clone(), json.clone())),
+            (("Lotus".to_owned(), 300), (captured.clone(), json)),
         ]);
 
-        let views = loadout_views(&parser, None, &members);
+        let views = loadout_views(&parser, &peer_views(&parser), None, &members);
         assert_eq!(
             cards(&views),
             [
@@ -487,6 +578,27 @@ mod tests {
             ]
         );
         assert_eq!(views[0].platform, "PC");
+        // The whole of a member's loadout rides along, for a window to hand out.
+        assert!(!views[1].json.is_empty());
+        assert!(views[2].json.is_empty(), "nothing captured for Lotus");
+        // Nobody else's IP answers to the host address, so the squad connects through us.
+        assert_eq!(
+            views.iter().map(|view| view.is_host).collect::<Vec<_>>(),
+            [true, false, false]
+        );
+        // A member's card carries where they connect from; ours has nothing to show.
+        assert_eq!(
+            (views[0].region.as_str(), views[0].country.as_str()),
+            ("", "")
+        );
+        assert_eq!(
+            (
+                views[1].region.as_str(),
+                views[1].country.as_str(),
+                views[1].country_code.as_str()
+            ),
+            ("Tokyo", "Japan", "JP")
+        );
 
         // Ours stays on top once captured; a member who leaves takes their card along.
         parser.process_line("6 Net [Info]: RemoveSquadMember: Tenno\u{e001} has been removed");
@@ -495,9 +607,15 @@ mod tests {
             platform: "PC".to_owned(),
             is_local: true,
             loadout: Some(captured),
+            ..LoadoutView::default()
         };
         assert_eq!(
-            cards(&loadout_views(&parser, Some(&own), &members)),
+            cards(&loadout_views(
+                &parser,
+                &peer_views(&parser),
+                Some(&own),
+                &members
+            )),
             [("LocalTenno", true, true), ("Lotus", false, false)]
         );
     }

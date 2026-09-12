@@ -25,6 +25,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 pub enum Command {
     /// Bring up the loadout window.
     ShowLoadouts,
+    /// Bring up the one that lists the mods on every slot.
+    ShowFullLoadouts,
     Exit,
 }
 
@@ -39,10 +41,20 @@ pub fn spawn(on_command: impl Fn(Command) + Send + 'static) {
 fn run(on_command: impl Fn(Command)) {
     let menu = Menu::new();
     let loadouts = MenuItem::new("Loadouts", true, None);
+    let full_loadouts = MenuItem::new("Loadouts (full)", true, None);
     let exit = MenuItem::new("Exit", true, None);
-    menu.append_items(&[&loadouts, &PredefinedMenuItem::separator(), &exit])
-        .expect("failed to build tray menu");
-    let (loadouts_id, exit_id) = (loadouts.id().clone(), exit.id().clone());
+    menu.append_items(&[
+        &loadouts,
+        &full_loadouts,
+        &PredefinedMenuItem::separator(),
+        &exit,
+    ])
+    .expect("failed to build tray menu");
+    let (loadouts_id, full_loadouts_id, exit_id) = (
+        loadouts.id().clone(),
+        full_loadouts.id().clone(),
+        exit.id().clone(),
+    );
 
     // Bound to a name for the lifetime of the pump: dropping the handle would take the
     // icon out of the notification area and leave the overlay with no way to quit.
@@ -63,6 +75,8 @@ fn run(on_command: impl Fn(Command)) {
             while let Ok(event) = MenuEvent::receiver().try_recv() {
                 if event.id == loadouts_id {
                     on_command(Command::ShowLoadouts);
+                } else if event.id == full_loadouts_id {
+                    on_command(Command::ShowFullLoadouts);
                 } else if event.id == exit_id {
                     on_command(Command::Exit);
                     return;

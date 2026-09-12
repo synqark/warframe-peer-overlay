@@ -27,10 +27,13 @@
 use std::{
     collections::{HashMap, HashSet},
     ffi::c_void,
-    fs,
+    fmt, fs,
     hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, RecvTimeoutError, Sender},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -85,6 +88,11 @@ pub struct OwnRequest {
 pub enum Job {
     Member(CaptureRequest),
     Own(OwnRequest),
+    /// Somebody else's loadout was just rebuilt: take note of what is in memory now, so that
+    /// their version is never mistaken for a freshly built one of ours.
+    Others {
+        pid: u32,
+    },
 }
 
 /// A loadout the worker found, handed back to the monitor.
@@ -95,13 +103,47 @@ pub enum Captured {
         name: String,
         bytes: usize,
         loadout: Loadout,
+        json: RawJson,
     },
     /// Our own, as last rebuilt.
     Own {
         name: String,
         platform: String,
         loadout: Loadout,
+        json: RawJson,
     },
+}
+
+/// A loadout as the game had it, kept whole so a window can hand it out entire — everything
+/// the summary leaves behind included. `Debug` gives a hash of it rather than its content:
+/// the monitor's snapshot signature would otherwise carry tens of kilobytes per player,
+/// formatted afresh twice a second.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct RawJson(Arc<str>);
+
+impl RawJson {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Over several lines, the way a file of it reads; the game keeps it all on one.
+    pub fn pretty(&self) -> String {
+        serde_json::from_str::<Value>(&self.0)
+            .and_then(|loadout| serde_json::to_string_pretty(&loadout))
+            .unwrap_or_else(|_| self.0.to_string())
+    }
+}
+
+impl From<&[u8]> for RawJson {
+    fn from(json: &[u8]) -> Self {
+        Self(String::from_utf8_lossy(json).into())
+    }
+}
+
+impl fmt::Debug for RawJson {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "RawJson({:x})", content_hash(self.0.as_bytes()))
+    }
 }
 
 /// What the loadout window shows of a loadout. Anything missing, or shaped otherwise than
@@ -124,8 +166,7 @@ pub struct Loadout {
     pub companion_name: Option<String>,
 }
 
-/// One equipped item. Its `WeaponUpgrades` are not kept yet: a flat list of paths mixing
-/// cosmetics, mods and arcanes, with `""` for an empty slot, which `names::Kind` tells apart.
+/// One equipped item.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Item {
     /// The game's internal path (`ItemType`), not a display name (see `names`).
@@ -137,6 +178,10 @@ pub struct Item {
     /// The parts a modular item is built from (`ModularPartTypes`), as internal paths; empty
     /// for any other item.
     pub parts: Vec<String>,
+    /// What is installed on it (`WeaponUpgrades`), as internal paths in the order the game
+    /// lists them, with the empty slots left out. Cosmetics, mods and arcanes share the list;
+    /// `names::Kind` tells them apart.
+    pub upgrades: Vec<String>,
 }
 
 /// `NORMAL` slots, as observed: warframe, secondary, primary, melee, then the archgun and
@@ -181,11 +226,23 @@ impl Item {
                     .collect()
             })
             .unwrap_or_default();
+        let upgrades = entry["WeaponUpgrades"]
+            .as_array()
+            .map(|upgrades| {
+                upgrades
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|path| !path.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
         Some(Self {
             path: path.to_owned(),
             rank: entry["Level"].as_u64(),
             forma: entry["Polarized"].as_u64(),
             parts,
+            upgrades,
         })
     }
 }
@@ -213,17 +270,27 @@ struct History {
     members: HashSet<u64>,
     /// The version last saved as our own.
     own: Option<u64>,
+    /// The mastery rank of the version last taken for ours. Rank never drops, so anything
+    /// under it belongs to somebody else. `pick_own` reaches past the floor when nothing else
+    /// clears it, so a wrong capture cannot lock ours out for good.
+    own_mastery: Option<u64>,
 }
 
 fn run(receiver: Receiver<Job>, captured: Sender<Captured>) {
     let directory = loadout_directory();
-    // Until the game shows ours again, the copy last saved stands in for it.
+    let mut history = History::default();
+    // Until the game shows ours again, the copy last saved stands in for it, and tells us the
+    // mastery rank ours cannot be below.
     if let Some(own) = directory.as_deref().and_then(latest_own) {
+        if let Captured::Own { loadout, .. } = &own {
+            history.own_mastery = loadout.mastery_rank;
+        }
         let _ = captured.send(own);
     }
     let mut members: Vec<(CaptureRequest, Instant)> = Vec::new();
     let mut own: Option<(OwnRequest, u32)> = None;
-    let mut history = History::default();
+    // A pass asked for to take note of what is in memory, after somebody else's rebuild.
+    let mut note: Option<u32> = None;
     loop {
         // Idle until asked; with work outstanding, wake up again to retry it.
         let received = if members.is_empty() && own.is_none() {
@@ -243,6 +310,7 @@ fn run(receiver: Receiver<Job>, captured: Sender<Captured>) {
                 Job::Member(request) => members.push((request, Instant::now())),
                 // A newer rebuild supersedes one still being looked for.
                 Job::Own(request) => own = Some((request, 0)),
+                Job::Others { pid } => note = Some(pid),
             }
         }
 
@@ -250,6 +318,7 @@ fn run(receiver: Receiver<Job>, captured: Sender<Captured>) {
             .iter()
             .map(|(request, _)| request.pid)
             .chain(own.iter().map(|(request, _)| request.pid))
+            .chain(note)
             .collect();
         pids.sort_unstable();
         pids.dedup();
@@ -271,6 +340,7 @@ fn run(receiver: Receiver<Job>, captured: Sender<Captured>) {
                             name: request.name.clone(),
                             bytes: request.bytes,
                             loadout,
+                            json: RawJson::from(json.as_slice()),
                         });
                     }
                     return false;
@@ -280,12 +350,13 @@ fn run(receiver: Receiver<Job>, captured: Sender<Captured>) {
             let own_done = match &mut own {
                 Some((request, passes)) if request.pid == pid => {
                     *passes += 1;
-                    let pick = pick_own(&found, &history.seen, &history.members);
+                    let pick = pick_own(&found, &history);
                     if let Some((hash, _)) = pick
                         && history.own != Some(hash)
                     {
                         history.own = Some(hash);
                         let json = &found[&hash].json;
+                        history.own_mastery = mastery_rank(json).or(history.own_mastery);
                         if let Some(directory) = &directory {
                             save_own(directory, request, json);
                         }
@@ -294,6 +365,7 @@ fn run(receiver: Receiver<Job>, captured: Sender<Captured>) {
                                 name: request.name.clone(),
                                 platform: request.platform.label().to_owned(),
                                 loadout,
+                                json: RawJson::from(json.as_slice()),
                             });
                         }
                     }
@@ -308,6 +380,8 @@ fn run(receiver: Receiver<Job>, captured: Sender<Captured>) {
             }
             history.seen.extend(found.keys().copied());
         }
+        // Whatever a note asked about has been taken in by the pass above.
+        note = None;
     }
 }
 
@@ -409,22 +483,42 @@ fn pick_member(found: &HashMap<u64, Found>, bytes: usize, taken: &HashSet<u64>) 
 }
 
 /// Our own current loadout: the most-copied version no earlier pass has met, if there is one
-/// (the rebuild itself, marked `true`), otherwise the most-copied version overall.
-fn pick_own(
-    found: &HashMap<u64, Found>,
-    seen: &HashSet<u64>,
-    members: &HashSet<u64>,
-) -> Option<(u64, bool)> {
-    let most_copied = |fresh_only: bool| {
+/// (the rebuild itself, marked `true`), otherwise the most-copied version overall. Versions
+/// saved for members, and any ranked below us, are never ours.
+fn pick_own(found: &HashMap<u64, Found>, history: &History) -> Option<(u64, bool)> {
+    let most_copied = |fresh_only: bool, by_rank: bool| {
         found
             .iter()
-            .filter(|(hash, _)| !members.contains(*hash) && (!fresh_only || !seen.contains(*hash)))
+            .filter(|(hash, entry)| {
+                !history.members.contains(*hash)
+                    && (!by_rank || ours_by_rank(&entry.json, history.own_mastery))
+                    && (!fresh_only || !history.seen.contains(*hash))
+            })
             .max_by_key(|(_, entry)| entry.copies)
             .map(|(hash, _)| *hash)
     };
-    most_copied(true)
+    most_copied(true, true)
         .map(|hash| (hash, true))
-        .or_else(|| most_copied(false).map(|hash| (hash, false)))
+        .or_else(|| most_copied(false, true).map(|hash| (hash, false)))
+        // Nothing clears the floor, so it was not ours that set it: take the most-copied
+        // version regardless and let it set the floor anew.
+        .or_else(|| most_copied(false, false).map(|hash| (hash, false)))
+}
+
+/// Whether a version's mastery rank leaves it ours to claim. A rank that cannot be read leaves
+/// the version in: only a changed loadout format could hide it, and then nothing would match.
+fn ours_by_rank(json: &[u8], floor: Option<u64>) -> bool {
+    match (mastery_rank(json), floor) {
+        (Some(rank), Some(floor)) => rank >= floor,
+        _ => true,
+    }
+}
+
+/// The `PlayerLevel` a loadout opens with: `LOADOUT_HEAD` ends right before the rank.
+fn mastery_rank(json: &[u8]) -> Option<u64> {
+    let digits = json.get(LOADOUT_HEAD.len()..)?;
+    let end = digits.iter().position(|byte| !byte.is_ascii_digit())?;
+    std::str::from_utf8(digits.get(..end)?).ok()?.parse().ok()
 }
 
 /// A read-only handle to another process, closed on drop.
@@ -566,6 +660,9 @@ fn latest_own(directory: &Path) -> Option<Captured> {
         name: record["name"].as_str()?.to_owned(),
         platform: record["platform"].as_str().unwrap_or_default().to_owned(),
         loadout: Loadout::from_json(&record["loadout"]),
+        json: serde_json::to_vec(&record["loadout"])
+            .map(|json| RawJson::from(json.as_slice()))
+            .unwrap_or_default(),
     })
 }
 
@@ -696,11 +793,16 @@ mod tests {
         let member = loadout(10, "/Example/Member");
         let found = census_of(&[(&old, 40), (&preset, 19), (&rebuilt, 3), (&member, 50)]);
         let members = HashSet::from([content_hash(&member)]);
+        let history = |seen: HashSet<u64>| History {
+            seen,
+            members: members.clone(),
+            ..History::default()
+        };
 
         // Freshly built wins even with few copies yet, and a member's loadout never counts.
         let seen = HashSet::from([content_hash(&old), content_hash(&preset)]);
         assert_eq!(
-            pick_own(&found, &seen, &members),
+            pick_own(&found, &history(seen)),
             Some((content_hash(&rebuilt), true))
         );
         // Nothing new: the most-copied version is the current one.
@@ -710,9 +812,51 @@ mod tests {
             content_hash(&rebuilt),
         ]);
         assert_eq!(
-            pick_own(&found, &seen, &members),
+            pick_own(&found, &history(seen)),
             Some((content_hash(&old), false))
         );
+    }
+
+    #[test]
+    fn leaves_another_players_freshly_built_loadout_out_of_ours() {
+        // The game rebuilds members' loadouts locally too, so a version no pass has met is not
+        // ours by that alone, and one ranked below us never is.
+        let ours = loadout(36, "/Example/Ours");
+        let theirs = loadout(31, "/Example/Theirs");
+        let found = census_of(&[(&ours, 40), (&theirs, 2)]);
+        let history = History {
+            seen: HashSet::from([content_hash(&ours)]),
+            own_mastery: Some(36),
+            ..History::default()
+        };
+
+        assert_eq!(
+            pick_own(&found, &history),
+            Some((content_hash(&ours), false)),
+            "ours stands, unchanged since the pass that met it"
+        );
+    }
+
+    #[test]
+    fn reaches_past_a_rank_floor_that_leaves_nothing() {
+        // A floor a wrong capture left behind must not lock ours out for good.
+        let ours = loadout(36, "/Example/Ours");
+        let found = census_of(&[(&ours, 40)]);
+        let history = History {
+            own_mastery: Some(40),
+            ..History::default()
+        };
+
+        assert_eq!(
+            pick_own(&found, &history),
+            Some((content_hash(&ours), false))
+        );
+    }
+
+    #[test]
+    fn reads_the_mastery_rank_a_loadout_opens_with() {
+        assert_eq!(mastery_rank(&loadout(36, "/Example/Suit")), Some(36));
+        assert_eq!(mastery_rank(br#"{"PlayerLevel":}"#), None);
     }
 
     #[test]
@@ -763,12 +907,15 @@ mod tests {
             name,
             platform,
             loadout,
+            json,
         }) = latest_own(&directory)
         else {
             panic!("our loadout was just saved");
         };
         assert_eq!((name.as_str(), platform.as_str()), ("LocalTenno", "PC"));
         assert_eq!(loadout.mastery_rank, Some(36));
+        // The whole of it comes back too, for a window to hand out.
+        assert!(json.pretty().contains("\"PlayerLevel\": 36"));
         assert_eq!(
             loadout.warframe.map(|item| item.path).as_deref(),
             Some("/Example/Suit")
@@ -784,7 +931,12 @@ mod tests {
             "PostOldPeace": false,
             "KubrowName": "Pup",
             "NORMAL": [
-                {"ItemType": "/Example/Suit", "Level": 30, "Polarized": 2},
+                {
+                    "ItemType": "/Example/Suit",
+                    "Level": 30,
+                    "Polarized": 2,
+                    "WeaponUpgrades": ["/Example/Skin", "", "/Example/Mod"],
+                },
                 {"ItemType": "/Example/Pistol", "Level": 25},
                 {"ItemType": "/Example/Rifle"},
                 {},
@@ -801,7 +953,13 @@ mod tests {
                 rank,
                 forma,
                 parts: Vec::new(),
+                upgrades: Vec::new(),
             })
+        };
+        let suit = Item {
+            // The empty slot between them is left out.
+            upgrades: vec!["/Example/Skin".to_owned(), "/Example/Mod".to_owned()],
+            ..item("/Example/Suit", Some(30), Some(2)).unwrap()
         };
         let moa = Item {
             parts: vec!["/Example/MoaHead".to_owned(), "/Example/MoaCore".to_owned()],
@@ -814,7 +972,7 @@ mod tests {
                 mastery_rank: Some(12),
                 post_new_war: Some(true),
                 post_old_peace: Some(false),
-                warframe: item("/Example/Suit", Some(30), Some(2)),
+                warframe: Some(suit),
                 primary: item("/Example/Rifle", None, None),
                 secondary: item("/Example/Pistol", Some(25), None),
                 melee: None,
@@ -822,6 +980,17 @@ mod tests {
                 companion_name: Some("Pup".to_owned()),
             }
         );
+    }
+
+    #[test]
+    fn lays_a_loadout_out_over_several_lines_to_be_handed_out() {
+        let json = RawJson::from(loadout(36, "/Example/Suit").as_slice());
+        assert!(json.pretty().starts_with("{\n  \"PlayerLevel\": 36,"));
+
+        // Whatever cannot be read stands as it came.
+        let broken = RawJson::from(b"{\"PlayerLevel\":".as_slice());
+        assert_eq!(broken.pretty(), "{\"PlayerLevel\":");
+        assert!(RawJson::default().is_empty());
     }
 
     #[test]

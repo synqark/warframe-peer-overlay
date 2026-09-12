@@ -24,7 +24,9 @@ regex = "1.12"
 rs-grid-icons = "0.1.3"
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "rustls"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+# `preserve_order`: a loadout keeps the order the game wrote it in, both in the files saved
+# and in what a card hands to the clipboard, rather than coming back sorted by key.
+serde_json = { version = "1.0", features = ["preserve_order"] }
 sysinfo = "0.39.6"
 tray-icon = "0.24.2"
 # Diagnostics_Debug and Memory: read-only access to the game's memory for loadout capture.
