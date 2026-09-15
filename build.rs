@@ -2,11 +2,18 @@
 //! warframe-public-export-plus submodule: one line per named item, sorted by path, as
 //! `path \t export \t part type \t name`, the name in `LANGUAGE`.
 //!
+//! Two kinds of line name something other than an exported item, because a loadout does not
+//! name them by an item's path. An aura is named by its dictionary key (`AuraName`), so every
+//! aura mod lends its key a line of its own under `Auras`. A focus school is named by a path no
+//! export lists (`FocusAbility`, as `/Lotus/Upgrades/Focus/Power/PowerFocusAbility`), so each
+//! school the focus export has a folder for gets a line under `FocusSchools`, named as the
+//! dictionary names that school's operator ability.
+//!
 //! Only the exports a loadout draws on are read. Without the submodule checked out the build
 //! still succeeds, with a warning and an empty table: items then show their internal paths.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     env, fs,
     path::{Path, PathBuf},
 };
@@ -45,7 +52,13 @@ struct ExportEntry {
     /// Which slot of a modular item a part fills.
     #[serde(rename = "partType")]
     part_type: Option<String>,
+    /// What sort of mod an upgrade is: `AURA`, `WARFRAME` and so on.
+    #[serde(rename = "type")]
+    kind: Option<String>,
 }
+
+/// Where the focus export keeps each school's upgrades, one folder a school.
+const FOCUS_PATH: &str = "/Lotus/Upgrades/Focus/";
 
 fn main() {
     let source =
@@ -67,24 +80,47 @@ fn main() {
     let dictionary: HashMap<String, String> = read(&dictionary);
 
     let mut rows = Vec::new();
+    let mut schools = BTreeSet::new();
     for export in EXPORTS {
         let file = source.join(format!("Export{export}.json"));
         println!("cargo::rerun-if-changed={}", file.display());
         let entries: HashMap<String, ExportEntry> = read(&file);
         for (path, entry) in entries {
-            let Some(name) = entry
-                .name
-                .and_then(|key| dictionary.get(&key))
+            if export == "FocusUpgrades"
+                && let Some(school) = path
+                    .strip_prefix(FOCUS_PATH)
+                    .and_then(|rest| rest.split('/').next())
+            {
+                schools.insert(school.to_owned());
+            }
+            let Some(key) = entry.name else {
+                continue;
+            };
+            let Some(name) = dictionary
+                .get(&key)
                 .map(|name| one_line(name))
                 .filter(|name| !name.is_empty())
             else {
                 continue;
             };
+            if export == "Upgrades" && entry.kind.as_deref() == Some("AURA") {
+                rows.push(format!("{key}\tAuras\t\t{name}"));
+            }
             let part = entry.part_type.unwrap_or_default();
             rows.push(format!("{path}\t{export}\t{part}\t{name}"));
         }
     }
+    for school in schools {
+        let ability = format!("/Lotus/Language/Items/Operator{school}AbilityName");
+        if let Some(name) = dictionary.get(&ability).map(|name| one_line(name)) {
+            rows.push(format!(
+                "{FOCUS_PATH}{school}/{school}FocusAbility\tFocusSchools\t\t{name}"
+            ));
+        }
+    }
     rows.sort_unstable();
+    // An aura mod and its variant (a quest's copy, say) share a key, and so a line.
+    rows.dedup();
     fs::write(&table, rows.join("\n")).expect("OUT_DIR is writable");
 }
 

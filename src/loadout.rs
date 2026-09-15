@@ -3,23 +3,35 @@
 //! A loadout lives in the game's heap as a NUL-terminated JSON string starting with
 //! `{"PlayerLevel":`: warframe and weapons with their mods, forma and levels, companion,
 //! archwing, operator, gear and focus. One pass over the game's memory collects every such
-//! string, counting identical copies, and serves two kinds of job:
+//! string, counting identical copies, and serves three kinds of job:
 //!
 //! - **Members.** When a player joins the squad, EE.log announces
 //!   `ProcessSquadMessage received JOIN message from <name>, loadout: <N> bytes`, and their
 //!   loadout is the string of exactly N bytes.
+//! - **Members' changes.** A member who changes their gear sends it again
+//!   (`HandleSquadMessage from <address> LOADOUT`), naming no size. The new version is found
+//!   through the game's own records, which keep a player's name just before the address of
+//!   their loadout: the version their records have moved to is theirs.
 //! - **Ourselves.** Every `BuildLoadOut for <local player>` (each change in the arsenal, leaving
 //!   it, loading into a mission) rebuilds our loadout as a new string within the same second.
-//!   The version no earlier pass has met is the one just built; without one, the most-copied
-//!   version is current, since superseded ones are freed within minutes. Members' versions
-//!   never count.
+//!   A version the previous pass did not meet is the one just built; without one, a version
+//!   copied about since is (the arsenal copies ours dozens of times over); without either,
+//!   ours has not changed. Copies alone cannot tell: an old loadout can linger in more copies
+//!   than the current one for as long as the game runs. Members' versions never count.
 //!
 //! Besides being saved, every loadout found is handed back to the monitor, summed up as a
-//! [`Loadout`], for the loadout window. Ours starts out as the copy last saved, until the game
+//! [`Loadout`], for the loadout windows. Ours starts out as the copy last saved, until the game
 //! shows it again.
 //!
-//! Nothing here depends on struct layouts or pointers, so a game update that moves things
-//! around in memory does not break it. Access is read-only
+//! What is saved is kept only as long as something can show it. Of our own, that is the latest
+//! and nothing else: an earlier copy is of no use to anything. Of a member's, it is as long as
+//! the history still has them — [`discard_unkept`] throws the rest away.
+//!
+//! Capturing by size, and our own loadout, depend on no struct layouts or pointers, so a game
+//! update that moves things around in memory does not break them. Following a member's changes
+//! reads the game's records, but assumes no offsets in them beyond how far before a loadout's
+//! address the name may lie; should that stop holding, changes simply stop showing. Access is
+//! read-only
 //! (`PROCESS_VM_READ | PROCESS_QUERY_INFORMATION`): nothing is written, injected or hooked. A
 //! pass takes a second or two, so captures run on a worker thread of their own and the monitor
 //! loop only hands it jobs.
@@ -39,6 +51,7 @@ use std::{
 };
 
 use directories::ProjectDirs;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use windows_sys::Win32::{
     Foundation::{CloseHandle, HANDLE},
@@ -64,8 +77,15 @@ const MAX_REGION: usize = 512 * 1024 * 1024;
 /// How often work that found nothing is retried, and for how long a member is looked for.
 const RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(20);
-/// Passes spent on one rebuild of our own loadout before settling for the most-copied version.
+/// Passes spent on one rebuild of our own loadout before settling for a stand-in for it.
 const OWN_PASSES: u32 = 2;
+/// Passes spent looking for a member's changed loadout before giving up on that message.
+const UPDATE_PASSES: u32 = 2;
+/// How far before a loadout's address a record keeps the name of the player it belongs to.
+/// The game's record keeps it 88 bytes before; the reach leaves it room to move.
+const OWNER_REACH: usize = 160;
+/// The longest player name, platform mark included, a record is taken to hold.
+const MAX_NAME: usize = 64;
 
 /// One member's loadout, announced by EE.log as `bytes` long.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,6 +94,16 @@ pub struct CaptureRequest {
     pub name: String,
     pub platform: Platform,
     pub bytes: usize,
+}
+
+/// A member's loadout, sent to the squad again since they joined (`HandleSquadMessage from
+/// <address> LOADOUT`): their arsenal changed. The line gives no size, so the new version is
+/// found through the records that tie a loadout to its player's name (`record_owner`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpdateRequest {
+    pub pid: u32,
+    pub name: String,
+    pub platform: Platform,
 }
 
 /// Our own loadout, just rebuilt.
@@ -87,6 +117,7 @@ pub struct OwnRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Job {
     Member(CaptureRequest),
+    Update(UpdateRequest),
     Own(OwnRequest),
     /// Somebody else's loadout was just rebuilt: take note of what is in memory now, so that
     /// their version is never mistaken for a freshly built one of ours.
@@ -104,6 +135,16 @@ pub enum Captured {
         bytes: usize,
         loadout: Loadout,
         json: RawJson,
+        /// What it was saved as, so that the history can name it and a clear-out spare it.
+        file: Option<String>,
+    },
+    /// A member's, changed since they joined. It stands for them in place of the one their
+    /// JOIN announced, until they leave or join again.
+    Update {
+        name: String,
+        loadout: Loadout,
+        json: RawJson,
+        file: Option<String>,
     },
     /// Our own, as last rebuilt.
     Own {
@@ -148,7 +189,11 @@ impl fmt::Debug for RawJson {
 
 /// What the loadout window shows of a loadout. Anything missing, or shaped otherwise than
 /// expected after a game update, is simply left out.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// The history keeps these, so a field added later must read as its default from an entry
+/// written down before it existed.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Loadout {
     /// `PlayerLevel`.
     pub mastery_rank: Option<u64>,
@@ -164,10 +209,25 @@ pub struct Loadout {
     pub companion: Option<Item>,
     /// The name the player gave their companion (`KubrowName`).
     pub companion_name: Option<String>,
+    /// The auras on the warframe, as the dictionary keys their names go by: `AuraName`, then
+    /// `ExtraAuraName` for a warframe with a second aura slot, the empty ones left out.
+    pub auras: Vec<String>,
+    /// Whoever stands behind the warframe, when the loadout brings one.
+    pub operator: Option<Operator>,
+}
+
+/// The operator (`OPERATOR`) or the drifter (`OPERATOR_ADULT`) a loadout brings, and the
+/// focus school they have on.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Operator {
+    /// The drifter rather than the operator.
+    pub drifter: bool,
+    /// The focus school's path (`FocusAbility`).
+    pub focus: Option<String>,
 }
 
 /// One equipped item.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Item {
     /// The game's internal path (`ItemType`), not a display name (see `names`).
     pub path: String,
@@ -205,12 +265,33 @@ impl Loadout {
             secondary: item("NORMAL", SECONDARY_SLOT),
             melee: item("NORMAL", MELEE_SLOT),
             companion: item("SENTINEL", COMPANION_SLOT),
-            companion_name: loadout["KubrowName"]
-                .as_str()
-                .filter(|name| !name.is_empty())
-                .map(str::to_owned),
+            companion_name: text(&loadout["KubrowName"]),
+            auras: ["AuraName", "ExtraAuraName"]
+                .into_iter()
+                .filter_map(|key| text(&loadout[key]))
+                .collect(),
+            operator: Operator::from_json(loadout),
         }
     }
+}
+
+impl Operator {
+    fn from_json(loadout: &Value) -> Option<Self> {
+        // Where a loadout has both, the drifter's is the later of the two.
+        let drifter = loadout.get("OPERATOR_ADULT").is_some();
+        (drifter || loadout.get("OPERATOR").is_some()).then(|| Self {
+            drifter,
+            focus: text(&loadout["FocusAbility"]),
+        })
+    }
+}
+
+/// A string that says something: an empty one is as good as none.
+fn text(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
 }
 
 impl Item {
@@ -259,17 +340,34 @@ pub fn spawn() -> (Sender<Job>, Receiver<Captured>) {
 struct Found {
     json: Vec<u8>,
     copies: usize,
+    /// Where each copy lies, for finding what points at them (`referrers`).
+    addresses: Vec<usize>,
+}
+
+/// What the worker knows of one squad member's loadout.
+struct MemberState {
+    /// The version last taken for theirs.
+    version: u64,
+    /// Every record that named them, by where it lies, with the version it pointed at when
+    /// last looked at.
+    records: HashMap<usize, u64>,
 }
 
 /// What the worker remembers between passes.
 #[derive(Default)]
 struct History {
-    /// Every version met so far, so a freshly built one stands out.
-    seen: HashSet<u64>,
+    /// Every version the previous pass met, with its copies, so that one built since stands
+    /// out, and so does one copied about since. `None` until a pass has run.
+    previous: Option<HashMap<u64, usize>>,
     /// Versions saved for squad members; never taken for our own.
     members: HashSet<u64>,
+    /// Each squad member's loadout as last taken, by name, with the records naming them.
+    member_states: HashMap<String, MemberState>,
     /// The version last saved as our own.
     own: Option<u64>,
+    /// Our own loadout as `self_latest.json` has it, looked for in memory until some version
+    /// has been taken for ours (`recognise_saved_own`).
+    saved_own: Option<Value>,
     /// The mastery rank of the version last taken for ours. Rank never drops, so anything
     /// under it belongs to somebody else. `pick_own` reaches past the floor when nothing else
     /// clears it, so a wrong capture cannot lock ours out for good.
@@ -282,18 +380,20 @@ fn run(receiver: Receiver<Job>, captured: Sender<Captured>) {
     // Until the game shows ours again, the copy last saved stands in for it, and tells us the
     // mastery rank ours cannot be below.
     if let Some(own) = directory.as_deref().and_then(latest_own) {
-        if let Captured::Own { loadout, .. } = &own {
+        if let Captured::Own { loadout, json, .. } = &own {
             history.own_mastery = loadout.mastery_rank;
+            history.saved_own = serde_json::from_str(&json.0).ok();
         }
         let _ = captured.send(own);
     }
     let mut members: Vec<(CaptureRequest, Instant)> = Vec::new();
+    let mut updates: Vec<(UpdateRequest, u32)> = Vec::new();
     let mut own: Option<(OwnRequest, u32)> = None;
     // A pass asked for to take note of what is in memory, after somebody else's rebuild.
     let mut note: Option<u32> = None;
     loop {
         // Idle until asked; with work outstanding, wake up again to retry it.
-        let received = if members.is_empty() && own.is_none() {
+        let received = if members.is_empty() && updates.is_empty() && own.is_none() {
             receiver.recv().map_err(|_| RecvTimeoutError::Disconnected)
         } else {
             receiver.recv_timeout(RETRY_INTERVAL)
@@ -308,6 +408,11 @@ fn run(receiver: Receiver<Job>, captured: Sender<Captured>) {
         for job in jobs {
             match job {
                 Job::Member(request) => members.push((request, Instant::now())),
+                // A later message from the same member starts the looking afresh.
+                Job::Update(request) => {
+                    updates.retain(|(pending, _)| pending.name != request.name);
+                    updates.push((request, 0));
+                }
                 // A newer rebuild supersedes one still being looked for.
                 Job::Own(request) => own = Some((request, 0)),
                 Job::Others { pid } => note = Some(pid),
@@ -317,39 +422,115 @@ fn run(receiver: Receiver<Job>, captured: Sender<Captured>) {
         let mut pids: Vec<u32> = members
             .iter()
             .map(|(request, _)| request.pid)
+            .chain(updates.iter().map(|(request, _)| request.pid))
             .chain(own.iter().map(|(request, _)| request.pid))
             .chain(note)
             .collect();
         pids.sort_unstable();
         pids.dedup();
         for pid in pids {
-            let found = census(pid);
+            let process = Process::open(pid);
+            let found = process.as_ref().map(census).unwrap_or_default();
             // Members first, so a version just given to one is never taken for our own.
+            let mut joined = Vec::new();
             members.retain(|(request, since)| {
                 if request.pid != pid {
                     return true;
                 }
                 if let Some(hash) = pick_member(&found, request.bytes, &history.members) {
                     history.members.insert(hash);
+                    joined.push((request.name.clone(), hash));
                     let json = &found[&hash].json;
-                    if let Some(directory) = &directory {
-                        save_member(directory, request, json);
-                    }
+                    let file = directory.as_deref().and_then(|directory| {
+                        save_member(directory, &request.name, request.platform, json)
+                    });
                     if let Some(loadout) = summarize(json) {
                         let _ = captured.send(Captured::Member {
                             name: request.name.clone(),
                             bytes: request.bytes,
                             loadout,
                             json: RawJson::from(json.as_slice()),
+                            file,
                         });
                     }
                     return false;
                 }
                 since.elapsed() < CAPTURE_TIMEOUT
             });
+
+            // Records are looked through only when there is somebody to look for: a member
+            // just captured, whose records are where their changes will show, or a member
+            // whose loadout changed.
+            let looking =
+                !joined.is_empty() || updates.iter().any(|(request, _)| request.pid == pid);
+            let records = process.as_ref().filter(|_| looking).map(|process| {
+                referrers(process, &found)
+                    .into_iter()
+                    .filter_map(|(place, version)| {
+                        Some((record_owner(process, place)?, place, version))
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let records_of = |name: &str| {
+                records
+                    .as_deref()
+                    .map_or_else(HashMap::new, |records| records_naming(records, name))
+            };
+            for (name, version) in joined {
+                // A change already on its way is weighed against no records at all: the
+                // JOIN it follows may be long gone, as when the log is replayed at start.
+                let records = if updates.iter().any(|(request, _)| request.name == name) {
+                    HashMap::new()
+                } else {
+                    records_of(&name)
+                };
+                history
+                    .member_states
+                    .insert(name, MemberState { version, records });
+            }
+            let mut updated = Vec::new();
+            updates.retain_mut(|(request, passes)| {
+                if request.pid != pid {
+                    return true;
+                }
+                *passes += 1;
+                let records = records_of(&request.name);
+                let state = history.member_states.get(&request.name);
+                let before = state.map(|state| &state.records);
+                let picked = pick_update(&records, before.unwrap_or(&HashMap::new()), &found);
+                let current = state.map(|state| state.version);
+                if let Some(version) = picked
+                    && Some(version) != current
+                {
+                    history.members.insert(version);
+                    updated.push(request.name.clone());
+                    let json = &found[&version].json;
+                    let file = directory.as_deref().and_then(|directory| {
+                        save_member(directory, &request.name, request.platform, json)
+                    });
+                    if let Some(loadout) = summarize(json) {
+                        let _ = captured.send(Captured::Update {
+                            name: request.name.clone(),
+                            loadout,
+                            json: RawJson::from(json.as_slice()),
+                            file,
+                        });
+                    }
+                }
+                if let Some(version) = picked.or(current) {
+                    history
+                        .member_states
+                        .insert(request.name.clone(), MemberState { version, records });
+                }
+                // Nothing moved yet: look once more in case the change is still arriving.
+                picked.is_none() && *passes < UPDATE_PASSES
+            });
+            // A change found is newer than the JOIN a member might still be looked for by.
+            members.retain(|(request, _)| !updated.contains(&request.name));
             let own_done = match &mut own {
                 Some((request, passes)) if request.pid == pid => {
                     *passes += 1;
+                    recognise_saved_own(&found, &mut history);
                     let pick = pick_own(&found, &history);
                     if let Some((hash, _)) = pick
                         && history.own != Some(hash)
@@ -369,16 +550,21 @@ fn run(receiver: Receiver<Job>, captured: Sender<Captured>) {
                             });
                         }
                     }
-                    // A version not met before is the rebuild itself; without one, look once
-                    // more in case it was still being written.
-                    pick.is_some_and(|(_, fresh)| fresh) || *passes >= OWN_PASSES
+                    // A version built or copied about since the previous pass is the rebuild
+                    // itself; without one, look once more in case it was still being written.
+                    pick.is_some_and(|(_, reason)| reason.is_the_rebuild()) || *passes >= OWN_PASSES
                 }
                 _ => false,
             };
             if own_done {
                 own = None;
             }
-            history.seen.extend(found.keys().copied());
+            history.previous = Some(
+                found
+                    .iter()
+                    .map(|(hash, entry)| (*hash, entry.copies))
+                    .collect(),
+            );
         }
         // Whatever a note asked about has been taken in by the pass above.
         note = None;
@@ -386,11 +572,8 @@ fn run(receiver: Receiver<Job>, captured: Sender<Captured>) {
 }
 
 /// Every distinct loadout string in the game's memory, keyed by content hash.
-fn census(pid: u32) -> HashMap<u64, Found> {
+fn census(process: &Process) -> HashMap<u64, Found> {
     let mut found = HashMap::new();
-    let Some(process) = Process::open(pid) else {
-        return found;
-    };
     for (base, size) in process.regions() {
         let mut offset = 0;
         while offset < size {
@@ -406,6 +589,7 @@ fn census(pid: u32) -> HashMap<u64, Found> {
                 };
                 collect(
                     &data,
+                    chunk_base,
                     accept_before,
                     |start| process.read(chunk_base + start, MAX_LOADOUT),
                     &mut found,
@@ -421,11 +605,12 @@ fn census(pid: u32) -> HashMap<u64, Found> {
 }
 
 /// Adds every complete loadout string in `data` whose head starts before `accept_before`,
-/// counting identical copies. One that runs past the end of the chunk is fetched with
-/// `read_past(start)` instead. A string counts only if it ends in `}` right before its NUL
-/// terminator and parses as JSON.
+/// counting identical copies and noting where each lies (`data` starts at `base`). One that
+/// runs past the end of the chunk is fetched with `read_past(start)` instead. A string counts
+/// only if it ends in `}` right before its NUL terminator and parses as JSON.
 fn collect(
     data: &[u8],
+    base: usize,
     accept_before: usize,
     mut read_past: impl FnMut(usize) -> Option<Vec<u8>>,
     found: &mut HashMap<u64, Found>,
@@ -456,16 +641,171 @@ fn collect(
         let hash = content_hash(json);
         if let Some(entry) = found.get_mut(&hash) {
             entry.copies += 1;
+            entry.addresses.push(base + start);
         } else if serde_json::from_slice::<serde::de::IgnoredAny>(json).is_ok() {
             found.insert(
                 hash,
                 Found {
                     json: json.to_vec(),
                     copies: 1,
+                    addresses: vec![base + start],
                 },
             );
         }
     }
+}
+
+/// Every place in the game's memory that holds the address of a loadout string, with the
+/// version that string is. The records tying a loadout to its player are among them.
+fn referrers(process: &Process, found: &HashMap<u64, Found>) -> Vec<(usize, u64)> {
+    let mut strings = found
+        .iter()
+        .flat_map(|(hash, entry)| entry.addresses.iter().map(move |address| (*address, *hash)))
+        .collect::<Vec<_>>();
+    strings.sort_unstable();
+    let (Some(&(low, _)), Some(&(high, _))) = (strings.first(), strings.last()) else {
+        return Vec::new();
+    };
+    let mut places = Vec::new();
+    for (base, size) in process.regions() {
+        let mut offset = 0;
+        while offset < size {
+            let want = CHUNK.min(size - offset);
+            if let Some(data) = process.read(base + offset, want) {
+                // Regions start on a page, so every eighth byte starts an aligned word.
+                for (index, word) in data.chunks_exact(8).enumerate() {
+                    let value = usize::from_le_bytes(word.try_into().expect("eight bytes"));
+                    if (low..=high).contains(&value)
+                        && let Ok(at) =
+                            strings.binary_search_by_key(&value, |(address, _)| *address)
+                    {
+                        places.push((base + offset + index * 8, strings[at].1));
+                    }
+                }
+            }
+            offset += want;
+        }
+    }
+    places
+}
+
+/// The player a record holding a loadout's address at `place` belongs to.
+fn record_owner(process: &Process, place: usize) -> Option<String> {
+    // One word more than the reach, to tell whether a name at its far end starts there.
+    let len = OWNER_REACH + 8;
+    let window = process.read(place.checked_sub(len)?, len)?;
+    (window.len() == len)
+        .then(|| nearest_name(&window, |address, len| process.read(address, len)))
+        .flatten()
+}
+
+/// The player name a record keeps nearest the end of `window`, the stretch of it just before a
+/// loadout's address; its first word is only there to be looked back at. A short name is kept
+/// in place; a longer one as an address followed by a length word, whose top four bits are set,
+/// read with `read`. Names end in the platform mark, which is what tells them from the rest of
+/// a record, and the nearest is taken so that a record in a row of them is not put to the
+/// player of the record before it.
+fn nearest_name(window: &[u8], read: impl Fn(usize, usize) -> Option<Vec<u8>>) -> Option<String> {
+    let words = window.len() / 8;
+    let word = |index: usize| {
+        u64::from_le_bytes(
+            window[index * 8..index * 8 + 8]
+                .try_into()
+                .expect("eight bytes"),
+        )
+    };
+    for index in (1..words).rev() {
+        // In place, running from this word to its NUL — unless the word before is plain text
+        // too, in which case this is the tail of a name that starts earlier. Only plain text
+        // counts: a number that happens to have no small bytes in it is no part of a name.
+        let rest = &window[index * 8..];
+        let text = &rest[..memchr::memchr(0, rest).unwrap_or(rest.len())];
+        let continued = window[index * 8 - 8..index * 8]
+            .iter()
+            .all(|b| (0x20..=0x7e).contains(b));
+        if !continued && let Some(name) = player_name(text) {
+            return Some(name.to_owned());
+        }
+        // Elsewhere, by address and length.
+        if index + 1 < words {
+            let length = word(index + 1) as u32;
+            let len = (length & 0x0fff_ffff) as usize;
+            if length & 0xf000_0000 == 0xf000_0000
+                && (4..=MAX_NAME).contains(&len)
+                && let Some(bytes) = read(word(index) as usize, len)
+                && let Some(name) = player_name(&bytes)
+            {
+                return Some(name.to_owned());
+            }
+        }
+    }
+    None
+}
+
+/// The records of `name` among `records` (owner, where it lies, the version it points at), by
+/// where they lie — on versions most of whose named records name them, and no others. The game
+/// fills a record in while it may be being read, and one caught holding a player's name and
+/// somebody else's loadout would otherwise hand that loadout over; the loadout's own records,
+/// of which there are far more, outvote it.
+fn records_naming(records: &[(String, usize, u64)], name: &str) -> HashMap<usize, u64> {
+    // For each version: how many records name `name`, and how many name anybody.
+    let mut claims = HashMap::<u64, (usize, usize)>::new();
+    for (owner, _, version) in records {
+        let claim = claims.entry(*version).or_default();
+        claim.1 += 1;
+        if owner == name {
+            claim.0 += 1;
+        }
+    }
+    records
+        .iter()
+        .filter(|(owner, _, version)| {
+            let (theirs, everybody) = claims[version];
+            owner == name && theirs * 2 > everybody
+        })
+        .map(|(_, place, version)| (*place, *version))
+        .collect()
+}
+
+/// The name in `bytes`, when they hold a player name as the game keeps one: the name, then the
+/// mark of the platform it plays on, a character from the private use area (`\u{e000}` for
+/// PC and so on, as `parser` reads them).
+fn player_name(bytes: &[u8]) -> Option<&str> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mark = text.chars().last()?;
+    let name = text.strip_suffix(mark)?;
+    let fits = ('\u{e000}'..='\u{f8ff}').contains(&mark)
+        && !name.is_empty()
+        && name.len() <= MAX_NAME
+        && name
+            .chars()
+            .all(|c| !c.is_control() && !('\u{e000}'..='\u{f8ff}').contains(&c));
+    fits.then_some(name)
+}
+
+/// Which version a member's records say is theirs now. The game keeps one record per player
+/// that it updates in place, makes a new one for every loadout a player sends, and leaves old
+/// records pointing at old versions; so the versions that count are those pointed at by
+/// records that point somewhere else than `before` has them, or were not there then. The one
+/// most of those point at wins, the most-copied where they tie. `None` when nothing moved.
+fn pick_update(
+    records: &HashMap<usize, u64>,
+    before: &HashMap<usize, u64>,
+    found: &HashMap<u64, Found>,
+) -> Option<u64> {
+    let mut votes = HashMap::<u64, usize>::new();
+    for (place, version) in records {
+        if before.get(place) != Some(version) {
+            *votes.entry(*version).or_default() += 1;
+        }
+    }
+    votes
+        .into_iter()
+        .max_by_key(|&(version, votes)| {
+            let copies = found.get(&version).map_or(0, |entry| entry.copies);
+            (votes, copies, version)
+        })
+        .map(|(version, _)| version)
 }
 
 fn content_hash(bytes: &[u8]) -> u64 {
@@ -482,27 +822,113 @@ fn pick_member(found: &HashMap<u64, Found>, bytes: usize, taken: &HashSet<u64>) 
         .map(|(hash, _)| *hash)
 }
 
-/// Our own current loadout: the most-copied version no earlier pass has met, if there is one
-/// (the rebuild itself, marked `true`), otherwise the most-copied version overall. Versions
-/// saved for members, and any ranked below us, are never ours.
-fn pick_own(found: &HashMap<u64, Found>, history: &History) -> Option<(u64, bool)> {
-    let most_copied = |fresh_only: bool, by_rank: bool| {
-        found
-            .iter()
-            .filter(|(hash, entry)| {
-                !history.members.contains(*hash)
-                    && (!by_rank || ours_by_rank(&entry.json, history.own_mastery))
-                    && (!fresh_only || !history.seen.contains(*hash))
-            })
-            .max_by_key(|(_, entry)| entry.copies)
-            .map(|(hash, _)| *hash)
+/// How `pick_own` came to the version it took for ours.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reason {
+    /// Not in memory at the previous pass: the rebuild itself. That includes a version met
+    /// long before, freed, and built again, as when a weapon is changed back.
+    Built,
+    /// In memory at the previous pass, but in more copies now: an unchanged loadout rebuilt
+    /// and copied about, as the arsenal copies ours dozens of times over on the way in.
+    Copied,
+    /// Nothing built or copied about: the version already taken for ours, still in memory.
+    /// Leaving the arsenal rebuilds ours unchanged and lets its copies go, while an old
+    /// loadout can linger in more copies than the current one for as long as the game runs.
+    Kept,
+    /// Nothing to go on, as on the first pass: the most-copied version.
+    MostCopied,
+}
+
+impl Reason {
+    /// Whether the version is the rebuild a job asked about, rather than a stand-in for it.
+    fn is_the_rebuild(self) -> bool {
+        matches!(self, Self::Built | Self::Copied)
+    }
+}
+
+/// Our own current loadout, and how it was told (see `Reason`, in the order tried). Versions
+/// saved for members, and any ranked below us, are never ours — unless nothing clears that
+/// floor, in which case it was not ours that set it, and every version is tried again to let
+/// one set the floor anew.
+fn pick_own(found: &HashMap<u64, Found>, history: &History) -> Option<(u64, Reason)> {
+    pick_own_among(found, history, true).or_else(|| pick_own_among(found, history, false))
+}
+
+fn pick_own_among(
+    found: &HashMap<u64, Found>,
+    history: &History,
+    by_rank: bool,
+) -> Option<(u64, Reason)> {
+    let candidates = found
+        .iter()
+        .filter(|(hash, entry)| {
+            !history.members.contains(*hash)
+                && (!by_rank || ours_by_rank(&entry.json, history.own_mastery))
+        })
+        .map(|(hash, entry)| (*hash, entry.copies))
+        .collect::<Vec<_>>();
+    // The one ahead by `key`, and by copies where two are level.
+    let ahead = |versions: &mut dyn Iterator<Item = (u64, usize, usize)>| {
+        versions
+            .max_by_key(|&(_, key, copies)| (key, copies))
+            .map(|(hash, _, _)| hash)
     };
-    most_copied(true, true)
-        .map(|hash| (hash, true))
-        .or_else(|| most_copied(false, true).map(|hash| (hash, false)))
-        // Nothing clears the floor, so it was not ours that set it: take the most-copied
-        // version regardless and let it set the floor anew.
-        .or_else(|| most_copied(false, false).map(|hash| (hash, false)))
+
+    if let Some(previous) = &history.previous {
+        let built = ahead(
+            &mut candidates
+                .iter()
+                .filter(|(hash, _)| !previous.contains_key(hash))
+                .map(|&(hash, copies)| (hash, copies, copies)),
+        );
+        if let Some(hash) = built {
+            return Some((hash, Reason::Built));
+        }
+        let copied = ahead(&mut candidates.iter().filter_map(|&(hash, copies)| {
+            let grown = copies
+                .checked_sub(*previous.get(&hash)?)
+                .filter(|&grown| grown > 0)?;
+            Some((hash, grown, copies))
+        }));
+        if let Some(hash) = copied {
+            return Some((hash, Reason::Copied));
+        }
+    }
+    if let Some(own) = history.own
+        && candidates.iter().any(|&(hash, _)| hash == own)
+    {
+        return Some((own, Reason::Kept));
+    }
+    ahead(
+        &mut candidates
+            .iter()
+            .map(|&(hash, copies)| (hash, copies, copies)),
+    )
+    .map(|hash| (hash, Reason::MostCopied))
+}
+
+/// Until some version has been taken for ours, looks for the one `self_latest.json` holds and
+/// takes that: a restart carries on from the loadout we had, rather than from whichever version
+/// lingers in the most copies. The saved copy was laid out afresh when it was written, so it is
+/// compared as JSON rather than byte for byte.
+fn recognise_saved_own(found: &HashMap<u64, Found>, history: &mut History) {
+    if history.own.is_some() {
+        history.saved_own = None;
+        return;
+    }
+    let Some(saved) = &history.saved_own else {
+        return;
+    };
+    let recognised = found
+        .iter()
+        .find(|(_, entry)| {
+            serde_json::from_slice::<Value>(&entry.json).is_ok_and(|json| &json == saved)
+        })
+        .map(|(hash, _)| *hash);
+    if recognised.is_some() {
+        history.own = recognised;
+        history.saved_own = None;
+    }
 }
 
 /// Whether a version's mastery rank leaves it ours to claim. A rank that cannot be read leaves
@@ -617,31 +1043,63 @@ fn record(name: &str, platform: Platform, captured: u64, json: &[u8]) -> Option<
     .ok()
 }
 
-fn save_member(directory: &Path, request: &CaptureRequest, json: &[u8]) {
+/// Writes a member's loadout down, and says what it ended up called.
+fn save_member(directory: &Path, name: &str, platform: Platform, json: &[u8]) -> Option<String> {
     let captured = since_epoch().as_secs();
-    if let Some(body) = record(&request.name, request.platform, captured, json)
-        && fs::create_dir_all(directory).is_ok()
-    {
-        let path = directory.join(file_name(captured, &request.name, request.platform));
-        let _ = fs::write(path, body);
-    }
+    let body = record(name, platform, captured, json)?;
+    fs::create_dir_all(directory).ok()?;
+    let file = file_name(captured, name, platform);
+    fs::write(directory.join(&file), body).ok()?;
+    Some(file)
 }
 
-/// Adds to our own history under `self/` and replaces `self_latest.json`. The latest copy is
-/// written aside and renamed over, so something reading it never sees half a file.
+/// Replaces `self_latest.json`, the only copy of our own that is kept: it is written aside and
+/// renamed over, so something reading it never sees half a file.
 fn save_own(directory: &Path, request: &OwnRequest, json: &[u8]) {
-    let now = since_epoch();
-    let history = directory.join("self");
-    let Some(body) = record(&request.name, request.platform, now.as_secs(), json) else {
+    let now = since_epoch().as_secs();
+    let Some(body) = record(&request.name, request.platform, now, json) else {
         return;
     };
-    if fs::create_dir_all(&history).is_err() {
+    if fs::create_dir_all(directory).is_err() {
         return;
     }
-    let _ = fs::write(history.join(format!("{}.json", now.as_millis())), &body);
     let staged = directory.join("self_latest.json.tmp");
     if fs::write(&staged, &body).is_ok() {
         let _ = fs::rename(&staged, directory.join("self_latest.json"));
+    }
+}
+
+/// Clears out what nothing can show any more: every member loadout `kept` does not name, and
+/// `self/`, the archive of our own rebuilds that earlier versions kept beside
+/// `self_latest.json` and nothing ever read.
+///
+/// A member file captured after `horizon` — the last departure the history wrote down — is
+/// spared whether it is named or not: it belongs to a squad still together, whose members are
+/// written down only once they leave.
+pub fn discard_unkept(kept: &HashSet<&str>, horizon: u64) {
+    if let Some(directory) = loadout_directory() {
+        discard(&directory, kept, horizon);
+    }
+}
+
+fn discard(directory: &Path, kept: &HashSet<&str>, horizon: u64) {
+    let _ = fs::remove_dir_all(directory.join("self"));
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file = entry.file_name();
+        // Only what `file_name` wrote is ours to throw away: anything else in the folder — the
+        // latest copy of our own among it — opens with no capture time and is left alone.
+        let Some(captured) = file
+            .to_str()
+            .and_then(|file| file.split('_').next()?.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if captured <= horizon && !kept.contains(file.to_string_lossy().as_ref()) {
+            let _ = fs::remove_file(entry.path());
+        }
     }
 }
 
@@ -701,6 +1159,7 @@ mod tests {
                     Found {
                         json: json.to_vec(),
                         copies: *copies,
+                        addresses: Vec::new(),
                     },
                 )
             })
@@ -722,11 +1181,17 @@ mod tests {
         memory.push(0);
 
         let mut found = HashMap::new();
-        collect(&memory, memory.len(), |_| None, &mut found);
+        collect(&memory, 0x1000, memory.len(), |_| None, &mut found);
 
         assert_eq!(found.len(), 2);
         assert_eq!(found[&content_hash(&suit)].copies, 2);
         assert_eq!(found[&content_hash(&other)].copies, 1);
+        // Where each copy lies, counted from where the chunk starts.
+        let second = 5 + suit.len() + 1 + 5 + other.len() + 1 + 5;
+        assert_eq!(
+            found[&content_hash(&suit)].addresses,
+            [0x1000 + 5, 0x1000 + second]
+        );
     }
 
     #[test]
@@ -736,7 +1201,7 @@ mod tests {
         memory.push(0);
 
         let mut found = HashMap::new();
-        collect(&memory, 5, |_| None, &mut found);
+        collect(&memory, 0, 5, |_| None, &mut found);
 
         assert!(found.is_empty());
     }
@@ -752,6 +1217,7 @@ mod tests {
         let mut found = HashMap::new();
         collect(
             chunk,
+            0,
             chunk.len(),
             |start| whole.get(start..).map(<[u8]>::to_vec),
             &mut found,
@@ -767,9 +1233,151 @@ mod tests {
         let mut heap = suit.clone();
         heap.push(0);
         let heap = std::hint::black_box(heap);
+        // And a record of the test's own making holds its address, as the game's do.
+        let record = std::hint::black_box(Box::new(heap.as_ptr() as usize));
 
-        assert!(census(std::process::id()).contains_key(&content_hash(&suit)));
-        drop(heap);
+        let process = Process::open(std::process::id()).expect("a process may read itself");
+        let found = census(&process);
+        let hash = content_hash(&suit);
+        assert!(found[&hash].addresses.contains(&(heap.as_ptr() as usize)));
+        let place = std::ptr::from_ref::<usize>(&record) as usize;
+        assert!(referrers(&process, &found).contains(&(place, hash)));
+        drop((heap, record));
+    }
+
+    /// A record as the game lays one out, in words: the player's name (by address and length,
+    /// or in place) some way before the address of their loadout, which ends the window.
+    fn record_window(fields: &[u64]) -> Vec<u8> {
+        fields.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
+    /// Up to eight bytes of text as the word that holds them in place.
+    fn in_place(text: &[u8]) -> u64 {
+        let mut word = [0; 8];
+        word[..text.len()].copy_from_slice(text);
+        u64::from_le_bytes(word)
+    }
+
+    #[test]
+    fn reads_the_name_of_the_player_a_record_belongs_to() {
+        // A member's record: name kept elsewhere, then ids, then the loadout's address (which
+        // lies just past the window). Our own name follows the loadout, out of the window.
+        let name = "Tenno\u{e000}".as_bytes().to_vec();
+        let id = b"0123456789abcdef01234567".to_vec();
+        let window = record_window(&[
+            0x7ff6_0000_0000,
+            0x2000,                                    // name, by address…
+            0xff00_0001_f000_0000 | name.len() as u64, // …and length
+            0x3000,                                    // an id by address…
+            0xff00_0001_f000_0018,                     // …and length
+            0,
+            0x3000,
+            0xff00_0001_f000_0018,
+        ]);
+        let read = |address: usize, len: usize| match address {
+            0x2000 => Some(name[..len.min(name.len())].to_vec()),
+            0x3000 => Some(id[..len.min(id.len())].to_vec()),
+            _ => None,
+        };
+        assert_eq!(nearest_name(&window, read).as_deref(), Some("Tenno"));
+
+        // A row of records keeping short names in place: the nearest is the owner, and the
+        // tail of a longer name that runs into a second word is not a name of its own.
+        let window = record_window(&[
+            in_place(b"LongName"),
+            in_place("12\u{e000}".as_bytes()),
+            0x4000,
+            0xff00_0001_f000_0100,
+            in_place("Lotus\u{e000}".as_bytes()),
+            0,
+        ]);
+        assert_eq!(nearest_name(&window, |_, _| None).as_deref(), Some("Lotus"));
+        let window = record_window(&[0, in_place(b"LongName"), in_place("12\u{e000}".as_bytes())]);
+        assert_eq!(
+            nearest_name(&window, |_, _| None).as_deref(),
+            Some("LongName12")
+        );
+        // A number before a name, with no small bytes in it, does not make the name a tail.
+        let window = record_window(&[
+            0,
+            0xa2d2_969e_7683_51c8,
+            in_place(b"TennoAbc"),
+            in_place("d\u{e000}".as_bytes()),
+        ]);
+        assert_eq!(
+            nearest_name(&window, |_, _| None).as_deref(),
+            Some("TennoAbcd")
+        );
+        // The first word is only looked back at: a name's tail there names nobody.
+        let window = record_window(&[in_place("d\u{e000}".as_bytes()), 0]);
+        assert_eq!(nearest_name(&window, |_, _| None), None);
+
+        // Ids and other text carry no platform mark, so they name nobody.
+        let window = record_window(&[0, 0x3000, 0xff00_0001_f000_0018]);
+        assert_eq!(nearest_name(&window, read), None);
+    }
+
+    #[test]
+    fn leaves_out_a_record_caught_naming_somebody_else_on_a_loadout() {
+        let (ours, theirs) = (1_u64, 2_u64);
+        let mut records = vec![
+            ("Tenno".to_owned(), 0x100, theirs),
+            ("Tenno".to_owned(), 0x200, theirs),
+            // Caught while the game filled it in: their name, our loadout.
+            ("Tenno".to_owned(), 0x300, ours),
+        ];
+        records.extend((0..5).map(|i| ("Lotus".to_owned(), 0x1000 + i, ours)));
+
+        assert_eq!(
+            records_naming(&records, "Tenno"),
+            HashMap::from([(0x100, theirs), (0x200, theirs)])
+        );
+        assert_eq!(records_naming(&records, "Lotus").len(), 5);
+        assert!(records_naming(&records, "Ordis").is_empty());
+    }
+
+    #[test]
+    fn tells_a_player_name_by_its_platform_mark() {
+        assert_eq!(player_name("Tenno\u{e000}".as_bytes()), Some("Tenno"));
+        assert_eq!(
+            player_name("Some Gamertag\u{e001}".as_bytes()),
+            Some("Some Gamertag")
+        );
+        assert_eq!(player_name(b"Tenno"), None);
+        assert_eq!(player_name("\u{e000}".as_bytes()), None);
+        assert_eq!(player_name(b"0123456789abcdef01234567"), None);
+    }
+
+    #[test]
+    fn takes_the_version_a_members_records_have_moved_to() {
+        let (joined, changed, older) = (
+            loadout(16, "/Example/Joined"),
+            loadout(16, "/Example/Changed"),
+            loadout(16, "/Example/Older"),
+        );
+        let found = census_of(&[(&joined, 8), (&changed, 4), (&older, 2)]);
+        let (joined, changed, older) = (
+            content_hash(&joined),
+            content_hash(&changed),
+            content_hash(&older),
+        );
+        // The record kept per player, the one made for the JOIN, and one left from before.
+        let before = HashMap::from([(0x100, joined), (0x200, joined), (0x300, older)]);
+
+        // Changed in place, and a new record for the message: the lingering one is outvoted.
+        let after = HashMap::from([
+            (0x100, changed),
+            (0x200, joined),
+            (0x300, older),
+            (0x400, changed),
+        ]);
+        assert_eq!(pick_update(&after, &before, &found), Some(changed));
+
+        // Nothing moved: nothing to take.
+        assert_eq!(pick_update(&before, &before, &found), None);
+
+        // Nothing to weigh against, as after a restart: most records win.
+        assert_eq!(pick_update(&after, &HashMap::new(), &found), Some(changed));
     }
 
     #[test]
@@ -785,6 +1393,16 @@ mod tests {
         assert_eq!(pick_member(&found, long.len(), &taken), None);
     }
 
+    /// The copies each version had at the previous pass.
+    fn previous(versions: &[(&[u8], usize)]) -> Option<HashMap<u64, usize>> {
+        Some(
+            versions
+                .iter()
+                .map(|(json, copies)| (content_hash(json), *copies))
+                .collect(),
+        )
+    }
+
     #[test]
     fn our_own_loadout_is_the_version_just_built() {
         let old = loadout(36, "/Example/Old");
@@ -793,27 +1411,105 @@ mod tests {
         let member = loadout(10, "/Example/Member");
         let found = census_of(&[(&old, 40), (&preset, 19), (&rebuilt, 3), (&member, 50)]);
         let members = HashSet::from([content_hash(&member)]);
-        let history = |seen: HashSet<u64>| History {
-            seen,
+
+        // Freshly built wins even with few copies yet, and a member's loadout never counts.
+        let history = History {
+            previous: previous(&[(&old, 40), (&preset, 19)]),
             members: members.clone(),
             ..History::default()
         };
-
-        // Freshly built wins even with few copies yet, and a member's loadout never counts.
-        let seen = HashSet::from([content_hash(&old), content_hash(&preset)]);
         assert_eq!(
-            pick_own(&found, &history(seen)),
-            Some((content_hash(&rebuilt), true))
+            pick_own(&found, &history),
+            Some((content_hash(&rebuilt), Reason::Built))
         );
-        // Nothing new: the most-copied version is the current one.
-        let seen = HashSet::from([
-            content_hash(&old),
-            content_hash(&preset),
-            content_hash(&rebuilt),
-        ]);
+
+        // No pass before, and nothing taken for ours yet: nothing to go on but copies.
+        let history = History {
+            members,
+            ..History::default()
+        };
         assert_eq!(
-            pick_own(&found, &history(seen)),
-            Some((content_hash(&old), false))
+            pick_own(&found, &history),
+            Some((content_hash(&old), Reason::MostCopied))
+        );
+    }
+
+    // The next three follow a recording of the game's memory through two visits to the
+    // arsenal: an old loadout lingered in 18 copies the whole time, while the current one sat
+    // in 4 outside the arsenal and ran to a hundred inside it.
+
+    #[test]
+    fn keeps_ours_when_leaving_the_arsenal_rebuilds_it_unchanged() {
+        let lingering = loadout(36, "/Example/Volt");
+        let current = loadout(36, "/Example/Soma");
+        let found = census_of(&[(&lingering, 18), (&current, 4)]);
+        let history = History {
+            previous: previous(&[(&lingering, 18), (&current, 49)]),
+            own: Some(content_hash(&current)),
+            ..History::default()
+        };
+
+        assert_eq!(
+            pick_own(&found, &history),
+            Some((content_hash(&current), Reason::Kept)),
+            "not the old loadout, for all its copies"
+        );
+    }
+
+    #[test]
+    fn takes_the_version_the_arsenal_copies_about() {
+        // Ours was taken wrongly before: entering the arsenal puts it right.
+        let lingering = loadout(36, "/Example/Volt");
+        let current = loadout(36, "/Example/Rhino");
+        let found = census_of(&[(&lingering, 18), (&current, 48)]);
+        let history = History {
+            previous: previous(&[(&lingering, 18), (&current, 4)]),
+            own: Some(content_hash(&lingering)),
+            ..History::default()
+        };
+
+        assert_eq!(
+            pick_own(&found, &history),
+            Some((content_hash(&current), Reason::Copied))
+        );
+    }
+
+    #[test]
+    fn takes_a_version_built_again_after_it_was_let_go() {
+        // Boar Prime, then Soma Prime, then Boar Prime again: the first version was met long
+        // before, but freed in between, so its return is the rebuild.
+        let lingering = loadout(36, "/Example/Volt");
+        let soma = loadout(36, "/Example/Soma");
+        let boar = loadout(36, "/Example/Boar");
+        let found = census_of(&[(&lingering, 18), (&soma, 11), (&boar, 56)]);
+        let history = History {
+            previous: previous(&[(&lingering, 18), (&soma, 63)]),
+            own: Some(content_hash(&soma)),
+            ..History::default()
+        };
+
+        assert_eq!(
+            pick_own(&found, &history),
+            Some((content_hash(&boar), Reason::Built))
+        );
+    }
+
+    #[test]
+    fn carries_on_from_the_saved_copy_of_ours_after_a_restart() {
+        let lingering = loadout(36, "/Example/Volt");
+        let current = loadout(36, "/Example/Rhino");
+        let found = census_of(&[(&lingering, 18), (&current, 4)]);
+        let mut history = History {
+            saved_own: serde_json::from_slice(&current).ok(),
+            ..History::default()
+        };
+
+        recognise_saved_own(&found, &mut history);
+        assert_eq!(history.own, Some(content_hash(&current)));
+        assert_eq!(history.saved_own, None, "looked for no longer");
+        assert_eq!(
+            pick_own(&found, &history),
+            Some((content_hash(&current), Reason::Kept))
         );
     }
 
@@ -825,14 +1521,15 @@ mod tests {
         let theirs = loadout(31, "/Example/Theirs");
         let found = census_of(&[(&ours, 40), (&theirs, 2)]);
         let history = History {
-            seen: HashSet::from([content_hash(&ours)]),
+            previous: previous(&[(&ours, 40)]),
+            own: Some(content_hash(&ours)),
             own_mastery: Some(36),
             ..History::default()
         };
 
         assert_eq!(
             pick_own(&found, &history),
-            Some((content_hash(&ours), false)),
+            Some((content_hash(&ours), Reason::Kept)),
             "ours stands, unchanged since the pass that met it"
         );
     }
@@ -849,7 +1546,7 @@ mod tests {
 
         assert_eq!(
             pick_own(&found, &history),
-            Some((content_hash(&ours), false))
+            Some((content_hash(&ours), Reason::MostCopied))
         );
     }
 
@@ -860,7 +1557,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_our_history_and_replaces_the_latest_copy() {
+    fn replaces_the_latest_copy_of_our_own_and_keeps_no_other() {
         // The thread name contains `::`, which Windows rejects in a file name.
         let directory =
             std::env::temp_dir().join(format!("warframe-peer-overlay-own-{}", std::process::id()));
@@ -872,7 +1569,6 @@ mod tests {
         };
 
         save_own(&directory, &request, &loadout(36, "/Example/First"));
-        thread::sleep(Duration::from_millis(5));
         save_own(&directory, &request, &loadout(36, "/Example/Second"));
 
         let latest: Value =
@@ -882,7 +1578,47 @@ mod tests {
             latest["loadout"]["NORMAL"][0]["ItemType"],
             "/Example/Second"
         );
-        assert_eq!(fs::read_dir(directory.join("self")).unwrap().count(), 2);
+        // The one before it is nowhere: only the latest is of any use.
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn clears_out_the_loadouts_nothing_can_show_any_more() {
+        // The thread name contains `::`, which Windows rejects in a file name.
+        let directory = std::env::temp_dir().join(format!(
+            "warframe-peer-overlay-discard-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(directory.join("self")).unwrap();
+        fs::write(directory.join("self").join("100.json"), "{}").unwrap();
+        for file in [
+            "10_WrittenDown_PC.json",
+            "20_Forgotten_PC.json",
+            "40_StillHere_PC.json",
+            "self_latest.json",
+        ] {
+            fs::write(directory.join(file), "{}").unwrap();
+        }
+
+        discard(&directory, &HashSet::from(["10_WrittenDown_PC.json"]), 30);
+
+        let mut left = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        left.sort();
+        // The one the history names stays, and so does one captured since the last departure it
+        // wrote down; our own archive goes whatever is in it, and so does the rest.
+        assert_eq!(
+            left,
+            [
+                "10_WrittenDown_PC.json",
+                "40_StillHere_PC.json",
+                "self_latest.json"
+            ]
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -930,6 +1666,10 @@ mod tests {
             "PostNewWar": true,
             "PostOldPeace": false,
             "KubrowName": "Pup",
+            "AuraName": "/Example/AuraName",
+            "ExtraAuraName": "",
+            "FocusAbility": "/Example/Focus/SchoolFocusAbility",
+            "OPERATOR_ADULT": [],
             "NORMAL": [
                 {
                     "ItemType": "/Example/Suit",
@@ -978,8 +1718,49 @@ mod tests {
                 melee: None,
                 companion: Some(moa),
                 companion_name: Some("Pup".to_owned()),
+                // A second aura slot left empty is no aura.
+                auras: vec!["/Example/AuraName".to_owned()],
+                operator: Some(Operator {
+                    drifter: true,
+                    focus: Some("/Example/Focus/SchoolFocusAbility".to_owned()),
+                }),
             }
         );
+    }
+
+    #[test]
+    fn tells_the_operator_from_the_drifter() {
+        let operator = |loadout| Loadout::from_json(&loadout).operator;
+        assert_eq!(
+            operator(json!({"OPERATOR": [], "FocusAbility": ""})),
+            Some(Operator {
+                drifter: false,
+                focus: None
+            })
+        );
+        assert!(operator(json!({"OPERATOR": [], "OPERATOR_ADULT": []})).is_some_and(|o| o.drifter));
+        // Without either, nobody stands behind the warframe, whatever focus is listed.
+        assert_eq!(operator(json!({"FocusAbility": "/Example/Focus"})), None);
+    }
+
+    #[test]
+    fn reads_a_summary_written_down_before_auras_and_operators_were_kept() {
+        let earlier = json!({
+            "mastery_rank": 30,
+            "post_new_war": true,
+            "post_old_peace": null,
+            "warframe": null,
+            "primary": null,
+            "secondary": null,
+            "melee": null,
+            "companion": null,
+            "companion_name": null,
+        });
+        let loadout: Loadout =
+            serde_json::from_value(earlier).expect("an older summary still reads");
+        assert_eq!(loadout.mastery_rank, Some(30));
+        assert!(loadout.auras.is_empty());
+        assert_eq!(loadout.operator, None);
     }
 
     #[test]

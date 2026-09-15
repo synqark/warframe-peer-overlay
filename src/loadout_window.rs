@@ -1,15 +1,16 @@
-//! The loadout window: an ordinary desktop window, unlike the overlay, meant to be moved
-//! beside the game or onto another monitor. It stays hidden until the tray menu asks for it,
-//! and closing it only hides it again, so it comes back where the user left it.
+//! The loadout windows: ordinary desktop windows, unlike the overlay, meant to be moved beside
+//! the game or onto another monitor. Each stays hidden until the tray menu asks for it, and
+//! closing one only hides it again, so it comes back where the user left it.
 //!
-//! One card per player: ours always on top, then each squad member in the order they joined,
-//! whose card goes as soon as they leave the squad. A card is a header line (name, mastery
-//! rank, platform, quest progress) over an equipment line (warframe, weapons, companion), and
-//! each line keeps its columns aligned from card to card.
+//! Every window shows a card per player, ours first, then each squad member in the order they
+//! joined, whose card goes as soon as they leave the squad. They differ in how a card is laid
+//! out (`Layout`): a line of gear per player (`COMPACT`), a tall card listing every slot's mods
+//! (`FULL`), six places in two rows of three (`GRID`), and everyone met before, one of them
+//! laid out as the tall card (`HISTORY`).
 //!
 //! egui's zoom factor is global, and the overlay drives it from the game's resolution (see
-//! `ui_scale`). This window belongs to the desktop instead, so every size here goes through
-//! `Scale`, which divides that zoom back out: the window follows its own monitor's scaling
+//! `ui_scale`). These windows belong to the desktop instead, so every size here goes through
+//! `Scale`, which divides that zoom back out: a window follows its own monitor's scaling
 //! whatever the game's resolution.
 
 use std::{
@@ -25,19 +26,20 @@ use std::{
 use directories::ProjectDirs;
 use eframe::egui::{
     self, Color32, CornerRadius, Frame, Galley, IconData, Margin, ScrollArea, Sense, Stroke,
-    TextFormat, ViewportBuilder, ViewportClass, ViewportCommand, ViewportId,
+    StrokeKind, TextFormat, UiBuilder, ViewportBuilder, ViewportClass, ViewportCommand, ViewportId,
     text::{LayoutJob, TextWrapping},
 };
 use serde::{Deserialize, Serialize};
 use warframe_peer_overlay::{
-    loadout::{Item, Loadout},
+    history::HistoryEntry,
+    loadout::{Item, Loadout, Operator},
     monitor::LoadoutView,
     names, tray,
 };
 
 use crate::{flag_icon_bytes, platform_color, text_format};
 
-/// What a window shows and the chrome around it. The two differ in nothing else: both take
+/// What a window shows and the chrome around it. The windows differ in nothing else: all take
 /// the same rows and run the same way.
 #[derive(Clone, Copy)]
 struct Layout {
@@ -47,7 +49,18 @@ struct Layout {
     /// The size the window first opens at; the user is free to resize it from there.
     initial_size: [f32; 2],
     min_size: [f32; 2],
-    draw: fn(&mut egui::Ui, &[LoadoutView]),
+    draw: fn(&mut egui::Ui, &mut Shown),
+}
+
+/// What a window has to draw with.
+#[derive(Default)]
+struct Shown {
+    /// The squad as it stands.
+    rows: Vec<LoadoutView>,
+    /// Players from squads gone by, newest first.
+    history: Arc<[HistoryEntry]>,
+    /// Which of those the history window has open.
+    chosen: Option<HistoryEntry>,
 }
 
 /// A card per player, stacked downwards, with all their gear on one line.
@@ -69,6 +82,25 @@ const FULL: Layout = Layout {
     draw: show_full_cards,
 };
 
+/// Six places in two rows of three, for a squad of six: cards as big as their share of the
+/// window, whatever its size.
+const GRID: Layout = Layout {
+    name: "loadouts-grid",
+    title: "Loadouts (6grid) - Warframe Peer Overlay",
+    initial_size: [1600.0, 900.0],
+    min_size: [640.0, 360.0],
+    draw: show_grid_cards,
+};
+
+/// Everyone met before down one side, whichever of them is chosen laid out on the other.
+const HISTORY: Layout = Layout {
+    name: "loadouts-history",
+    title: "History - Warframe Peer Overlay",
+    initial_size: [820.0, 760.0],
+    min_size: [420.0, 240.0],
+    draw: show_history,
+};
+
 const BACKGROUND: Color32 = Color32::from_rgb(10, 14, 20);
 const CARD_FILL: Color32 = Color32::from_rgb(28, 35, 46);
 /// Our own card is framed in the overlay's gold.
@@ -82,6 +114,13 @@ const HOST_COLOR: Color32 = Color32::from_rgb(244, 190, 70);
 /// Where a peer connects from, at the right end of the header line.
 const LOCATION: Color32 = Color32::from_rgb(190, 198, 210);
 const FLAG_SIZE: f32 = 13.0;
+/// The header's text sizes: the name, `HOST`, the mark that a card is ours, and mastery rank
+/// and platform.
+const NAME_SIZE: f32 = 17.0;
+const HOST_SIZE: f32 = 13.0;
+const OWN_MARK: &str = "自分";
+const OWN_MARK_SIZE: f32 = 11.0;
+const STANDING_SIZE: f32 = 14.0;
 const MOD_COLOR: Color32 = Color32::from_rgb(168, 178, 192);
 /// A tall card's content width: four cards, with their margins, the space between them, the
 /// window's own margins and room for the scroll bar, fit the 1440 the full window opens at.
@@ -89,9 +128,42 @@ const CARD_WIDTH: f32 = 312.0;
 /// How far a mod sits in from the item it is installed on.
 const MOD_INDENT: f32 = 10.0;
 /// Rows of mods each slot keeps room for on a tall card, two mods to a row, whatever the
-/// player has on: fourteen for the warframe, ten on the primary and the secondary, twelve on
-/// the melee and the companion. The slots then line up from card to card.
-const MOD_ROWS: [usize; 5] = [7, 5, 5, 6, 6];
+/// player has on: fourteen for the warframe and twelve for every other slot, a primary or a
+/// secondary carrying twelve as often as a melee does. The slots then line up from card to
+/// card.
+const MOD_ROWS: [usize; 5] = [7, 6, 6, 6, 6];
+/// The history's list: as wide as its columns, which are as wide as they need to be.
+const LIST_WIDTH: f32 = 400.0;
+const NAME_WIDTH: f32 = 150.0;
+const MASTERY_WIDTH: f32 = 52.0;
+const PLATFORM_WIDTH: f32 = 42.0;
+/// The grid's places, `GRID_COLUMNS` to a row.
+const GRID_PLACES: usize = 6;
+const GRID_COLUMNS: usize = 3;
+/// Room between the grid's cards, which stays as it is whatever size the cards are drawn at.
+const GRID_GAP: f32 = 8.0;
+/// A grid card's margin, and the width of what is inside it, at the size the card is designed
+/// at: two columns of gear, each a little narrower than a tall card, with room between. Six
+/// cards of it fill a Full HD window, a maximized one included.
+const GRID_MARGIN: [f32; 2] = [10.0, 8.0];
+const GRID_WIDTH: f32 = 608.0;
+const GRID_COLUMN_GAP: f32 = 16.0;
+/// The grid header's right-hand column: how wide a line of where the peer connects from may
+/// run before it is cut short, and the size it is written at.
+const GRID_PLACE_WIDTH: f32 = 160.0;
+const PLACE_SIZE: f32 = 13.0;
+/// What a grid card shows beneath its header, a row at a time: the column each of
+/// `GEAR_SLOTS` goes in, and `None` for the column of auras, operator and quests beside the
+/// companion (`show_grid_extras`).
+const GRID_GEAR: [[Option<usize>; 2]; 3] =
+    [[Some(0), Some(1)], [Some(2), Some(3)], [Some(4), None]];
+/// A grid card is drawn at a size that moves in twentieths as the window is resized, so text
+/// is not laid out afresh at every size the window passes through, and never below
+/// `FIT_MIN`, where it would be past reading anyway.
+const FIT_STEPS: f32 = 20.0;
+const FIT_MIN: f32 = 0.3;
+/// The outline of a place in the grid nobody has taken.
+const VACANT_STROKE: Color32 = Color32::from_rgb(52, 60, 72);
 /// Where mods and arcanes live, for those the export does not name.
 const MOD_PATH: &str = "/Lotus/Upgrades/Mods/";
 const ARCANE_PATH: &str = "CosmeticEnhancers/";
@@ -115,7 +187,7 @@ pub struct LoadoutWindow {
     /// size worked out again under another zoom would undo the user's resizing.
     builder: Option<ViewportBuilder>,
     visible: bool,
-    rows: Vec<LoadoutView>,
+    shown: Shown,
     /// Where the window was on the last pass, and what has been written down for it, so a
     /// drag is stored once it comes to rest rather than at every step.
     seen: Option<Placement>,
@@ -143,6 +215,16 @@ impl LoadoutWindow {
         Self::new(FULL)
     }
 
+    /// Six places in two rows of three, each card filling its share of the window.
+    pub fn grid() -> Self {
+        Self::new(GRID)
+    }
+
+    /// Everyone we have shared a squad with, and what they brought to it.
+    pub fn history() -> Self {
+        Self::new(HISTORY)
+    }
+
     fn new(layout: Layout) -> Self {
         let stored = placements().and_then(|file| read(&file, layout.name));
         Self {
@@ -150,7 +232,7 @@ impl LoadoutWindow {
             show_request: Arc::default(),
             builder: None,
             visible: false,
-            rows: Vec::new(),
+            shown: Shown::default(),
             seen: None,
             stored,
         }
@@ -163,7 +245,11 @@ impl LoadoutWindow {
     }
 
     pub fn set_rows(&mut self, rows: Vec<LoadoutView>) {
-        self.rows = rows;
+        self.shown.rows = rows;
+    }
+
+    pub fn set_history(&mut self, history: Arc<[HistoryEntry]>) {
+        self.shown.history = history;
     }
 
     /// Runs the window for one pass of the root viewport. Call it on every pass, shown or
@@ -202,7 +288,7 @@ impl LoadoutWindow {
                 self.visible = false;
             }
             if self.visible {
-                draw(ui, &self.rows);
+                draw(ui, &mut self.shown);
             }
         });
         if self.visible {
@@ -242,7 +328,7 @@ impl LoadoutWindow {
     }
 }
 
-/// Both windows' placements live in one file beside the loadouts, keyed by layout name.
+/// Every window's placement lives in one file beside the loadouts, keyed by layout name.
 fn placements() -> Option<PathBuf> {
     ProjectDirs::from("com", "synqark", "WarframePeerOverlay")
         .map(|dirs| dirs.data_local_dir().join("windows.json"))
@@ -253,7 +339,7 @@ fn read(file: &Path, name: &str) -> Option<Placement> {
     stored.get(name).copied()
 }
 
-/// Leaves whatever the other window has written down as it is.
+/// Leaves whatever the other windows have written down as it is.
 fn write(file: &Path, name: &str, placement: Placement) {
     let mut stored: HashMap<String, Placement> = fs::read(file)
         .ok()
@@ -302,6 +388,11 @@ impl Scale {
         points * self.0
     }
 
+    /// The same, for something drawn `factor` times its designed size.
+    fn times(self, factor: f32) -> Self {
+        Self(self.0 * factor)
+    }
+
     /// Both halves of a size or a position.
     fn scaled(self, [x, y]: [f32; 2]) -> [f32; 2] {
         [self.px(x), self.px(y)]
@@ -343,8 +434,9 @@ struct Geo {
     flag: Option<(String, Arc<[u8]>)>,
 }
 
-fn show_cards(ui: &mut egui::Ui, rows: &[LoadoutView]) {
+fn show_cards(ui: &mut egui::Ui, shown: &mut Shown) {
     let scale = Scale::of(ui.ctx());
+    let rows = &shown.rows;
     let cards: Vec<Card> = rows.iter().map(|row| lay_out(ui, row, scale)).collect();
     let header_widths = column_widths(cards.iter().map(|card| card.header.as_slice()));
     let gear_widths = column_widths(cards.iter().filter_map(|card| card.gear.as_deref()));
@@ -420,7 +512,7 @@ fn lay_out(ui: &egui::Ui, row: &LoadoutView, scale: Scale) -> Card {
 fn header(row: &LoadoutView, scale: Scale) -> Vec<(LayoutJob, Option<String>)> {
     let mut name = name_job(row, scale);
     if row.is_local && !row.name.is_empty() {
-        name.append("自分", scale.px(8.0), scale.text(11.0, MUTED));
+        name.append(OWN_MARK, scale.px(8.0), scale.text(OWN_MARK_SIZE, MUTED));
     }
     let mut header = vec![
         (name, None),
@@ -433,18 +525,22 @@ fn header(row: &LoadoutView, scale: Scale) -> Vec<(LayoutJob, Option<String>)> {
 
 /// The player's name, in gold when the card is ours.
 fn name_job(row: &LoadoutView, scale: Scale) -> LayoutJob {
+    name_job_at(row, NAME_SIZE, scale)
+}
+
+fn name_job_at(row: &LoadoutView, size: f32, scale: Scale) -> LayoutJob {
     let color = if row.is_local { GOLD_TEXT } else { TEXT };
     let name = if row.name.is_empty() {
         "自分"
     } else {
         &row.name
     };
-    single(name, 17.0, color, scale)
+    single(name, size, color, scale)
 }
 
 /// The mark that a card is ours, for a layout that keeps it apart from the name.
 fn own_mark(scale: Scale) -> LayoutJob {
-    single("自分", 11.0, MUTED, scale)
+    single(OWN_MARK, OWN_MARK_SIZE, MUTED, scale)
 }
 
 fn mastery_job(row: &LoadoutView, scale: Scale) -> LayoutJob {
@@ -454,17 +550,22 @@ fn mastery_job(row: &LoadoutView, scale: Scale) -> LayoutJob {
         .and_then(|loadout| loadout.mastery_rank)
         .map(|rank| format!("MR {rank}"))
         .unwrap_or_default();
-    single(&mastery, 14.0, GOLD_TEXT, scale)
+    single(&mastery, STANDING_SIZE, GOLD_TEXT, scale)
 }
 
 fn platform_job(row: &LoadoutView, scale: Scale) -> LayoutJob {
-    single(&row.platform, 14.0, platform_color(&row.platform), scale)
+    single(
+        &row.platform,
+        STANDING_SIZE,
+        platform_color(&row.platform),
+        scale,
+    )
 }
 
 /// Empty unless the squad connects through this player.
 fn host_job(row: &LoadoutView, scale: Scale) -> LayoutJob {
     let host = if row.is_host { "HOST" } else { "" };
-    single(host, 13.0, HOST_COLOR, scale)
+    single(host, HOST_SIZE, HOST_COLOR, scale)
 }
 
 /// How far the player is through the two quests a loadout tells about, each with what to say
@@ -582,8 +683,9 @@ fn show_cells(ui: &mut egui::Ui, cells: &[Cell], widths: &[f32]) {
 
 /// The tall cards: one per player, side by side, each listing the mods on every slot. It
 /// scrolls both ways, since a long list of mods, or a fifth player, outgrows the window.
-fn show_full_cards(ui: &mut egui::Ui, rows: &[LoadoutView]) {
+fn show_full_cards(ui: &mut egui::Ui, shown: &mut Shown) {
     let scale = Scale::of(ui.ctx());
+    let rows = &shown.rows;
     Frame::new()
         .fill(BACKGROUND)
         .inner_margin(scale.margin(10.0, 10.0))
@@ -598,6 +700,290 @@ fn show_full_cards(ui: &mut egui::Ui, rows: &[LoadoutView]) {
                 });
             });
         });
+}
+
+/// The grid: six places in two rows of three, filled as a squad of six would fill them — ours
+/// first, then each member in the order they joined — with a place nobody has taken outlined
+/// as vacant. Every card takes its share of the window, and what is on it is drawn at whatever
+/// size fills that share (`grid_fit`), so the window can be any size and still show all six.
+fn show_grid_cards(ui: &mut egui::Ui, shown: &mut Shown) {
+    let scale = Scale::of(ui.ctx());
+    Frame::new()
+        .fill(BACKGROUND)
+        .inner_margin(scale.margin(10.0, 10.0))
+        .show(ui, |ui| {
+            let area = ui.available_rect_before_wrap();
+            let gap = scale.px(GRID_GAP);
+            let rows = GRID_PLACES.div_ceil(GRID_COLUMNS);
+            let size = egui::vec2(
+                (area.width() - gap * (GRID_COLUMNS - 1) as f32) / GRID_COLUMNS as f32,
+                (area.height() - gap * (rows - 1) as f32) / rows as f32,
+            )
+            .max(egui::Vec2::ZERO);
+            let fitted = scale.times(grid_fit(ui, size, scale));
+            for place in 0..GRID_PLACES {
+                let at = egui::vec2((place % GRID_COLUMNS) as f32, (place / GRID_COLUMNS) as f32);
+                let rect = egui::Rect::from_min_size(
+                    area.min + at * (size + egui::Vec2::splat(gap)),
+                    size,
+                );
+                let mut card = ui.new_child(
+                    UiBuilder::new()
+                        .id_salt(("grid", place))
+                        .max_rect(rect)
+                        .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                );
+                // Whatever does not fit is cut off at the card's edge rather than drawn over
+                // the card beneath it.
+                card.set_clip_rect(rect.intersect(ui.clip_rect()));
+                match shown.rows.get(place) {
+                    Some(row) => show_grid_card(&mut card, row, rect, fitted),
+                    None => show_vacant_place(&card, rect, fitted),
+                }
+            }
+            ui.advance_cursor_after_rect(area);
+        });
+}
+
+/// How many times its designed size a grid card is drawn at for it to fill `size`. The width
+/// is `GRID_WIDTH`; the height is found by laying out a card out of sight, one with every line
+/// a captured loadout can have — its mod blocks keep their height whatever is installed, and
+/// the sample carries two auras and an operator, the most the column beside the companion
+/// holds, so no captured card stands taller.
+fn grid_fit(ui: &mut egui::Ui, size: egui::Vec2, scale: Scale) -> f32 {
+    let sample = LoadoutView {
+        name: "Tenno".to_owned(),
+        platform: "PC".to_owned(),
+        is_local: true,
+        is_host: true,
+        loadout: Some(Loadout {
+            mastery_rank: Some(30),
+            post_new_war: Some(true),
+            post_old_peace: Some(true),
+            auras: vec![
+                "/Sample/AuraName".to_owned(),
+                "/Sample/ExtraAuraName".to_owned(),
+            ],
+            operator: Some(Operator {
+                drifter: true,
+                focus: Some("/Sample/FocusAbility".to_owned()),
+            }),
+            ..Loadout::default()
+        }),
+        ..LoadoutView::default()
+    };
+    let mut sizing = ui.new_child(
+        UiBuilder::new()
+            .id_salt("grid-sizing")
+            .max_rect(egui::Rect::from_min_size(
+                ui.max_rect().min,
+                egui::vec2(scale.px(GRID_WIDTH), 10_000.0),
+            ))
+            .layout(egui::Layout::top_down(egui::Align::LEFT))
+            .invisible(),
+    );
+    // Out of sight and out of reach: nothing in it can be hovered either.
+    sizing.set_clip_rect(egui::Rect::NOTHING);
+    show_grid_card_contents(&mut sizing, &sample, scale);
+    let [margin_x, margin_y] = GRID_MARGIN;
+    let designed = egui::vec2(
+        scale.px(GRID_WIDTH + 2.0 * margin_x),
+        sizing.min_rect().height() + scale.px(2.0 * margin_y),
+    );
+    fit(size, designed)
+}
+
+/// The largest step of `FIT_STEPS` at which `designed` still fits in `size`.
+fn fit(size: egui::Vec2, designed: egui::Vec2) -> f32 {
+    let fit = (size / designed).min_elem();
+    // A hair over, so a ratio that is exactly a step, less rounding, still lands on it.
+    ((fit * FIT_STEPS + 1e-3).floor() / FIT_STEPS).max(FIT_MIN)
+}
+
+/// One player's place in the grid, their card filling it.
+fn show_grid_card(ui: &mut egui::Ui, row: &LoadoutView, rect: egui::Rect, scale: Scale) {
+    let [margin_x, margin_y] = GRID_MARGIN;
+    // Every card has a stroke as wide as our gold one, most of them unseen: a frame sets its
+    // contents in by its stroke's width, and without it the other cards' rows would stand a
+    // pixel higher than ours.
+    let stroke = if row.is_local {
+        OWN_STROKE
+    } else {
+        Color32::TRANSPARENT
+    };
+    Frame::new()
+        .fill(CARD_FILL)
+        .stroke(Stroke::new(scale.px(1.0), stroke))
+        .corner_radius(CornerRadius::same(scale.px(6.0).round() as u8))
+        .inner_margin(scale.margin(margin_x, margin_y))
+        .show(ui, |ui| {
+            ui.set_min_size(ui.available_size());
+            show_grid_card_contents(ui, row, scale);
+        });
+    copy_on_right_click(ui, rect, row);
+}
+
+/// A grid card's contents: its header across the whole of it, then its gear in two columns
+/// split down the middle, each slot under a rule with its mods beneath.
+fn show_grid_card_contents(ui: &mut egui::Ui, row: &LoadoutView, scale: Scale) {
+    ui.spacing_mut().item_spacing = egui::vec2(scale.px(8.0), scale.px(3.0));
+    show_grid_header(ui, row, scale);
+    let Some(loadout) = &row.loadout else {
+        ui.label(single("ロードアウト未取得", 13.0, MUTED, scale));
+        return;
+    };
+    let mut gear = gear(loadout);
+    let items = items(loadout);
+    for slots in GRID_GEAR {
+        ui.spacing_mut().item_spacing.x = scale.px(GRID_COLUMN_GAP);
+        ui.columns(2, |columns| {
+            for (column, slot) in columns.iter_mut().zip(slots) {
+                column.spacing_mut().item_spacing.x = scale.px(8.0);
+                column.add(egui::Separator::default().spacing(scale.px(6.0)));
+                match slot {
+                    Some(slot) => {
+                        let (value, details) = std::mem::take(&mut gear[slot]);
+                        show_full_slot(column, GEAR_SLOTS[slot], &value, details, scale);
+                        show_full_mods(column, items[slot], MOD_ROWS[slot], scale);
+                    }
+                    None => show_grid_extras(column, row, loadout, scale),
+                }
+            }
+        });
+    }
+}
+
+/// A place in the grid nobody has taken: its outline, and a word to say so.
+fn show_vacant_place(ui: &egui::Ui, rect: egui::Rect, scale: Scale) {
+    let painter = ui.painter();
+    painter.rect(
+        rect,
+        CornerRadius::same(scale.px(6.0).round() as u8),
+        Color32::TRANSPARENT,
+        Stroke::new(scale.px(1.0).max(1.0), VACANT_STROKE),
+        StrokeKind::Inside,
+    );
+    let label = ui.fonts_mut(|fonts| fonts.layout_job(single("未参加", 16.0, MUTED, scale)));
+    painter.galley(rect.center() - label.size() / 2.0, label, MUTED);
+}
+
+/// The history: everyone met before down the left, and whichever of them is chosen laid out
+/// on the right, exactly as the full window lays out a card.
+fn show_history(ui: &mut egui::Ui, shown: &mut Shown) {
+    let scale = Scale::of(ui.ctx());
+    let history = Arc::clone(&shown.history);
+    Frame::new()
+        .fill(BACKGROUND)
+        .inner_margin(scale.margin(10.0, 10.0))
+        .show(ui, |ui| {
+            ui.set_min_size(ui.available_size());
+            ui.horizontal_top(|ui| {
+                let height = ui.available_height();
+                ui.allocate_ui_with_layout(
+                    egui::vec2(scale.px(LIST_WIDTH), height),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        ui.set_width(scale.px(LIST_WIDTH));
+                        show_history_list(ui, &history, shown, scale);
+                    },
+                );
+                if let Some(chosen) = shown.chosen.clone() {
+                    ScrollArea::vertical()
+                        .id_salt("chosen")
+                        .auto_shrink(false)
+                        .show(ui, |ui| show_full_card(ui, &chosen.view, scale));
+                }
+            });
+        });
+}
+
+/// Everyone met before, newest first. Only the rows on screen are laid out: there can be a
+/// thousand of them.
+fn show_history_list(ui: &mut egui::Ui, history: &[HistoryEntry], shown: &mut Shown, scale: Scale) {
+    if history.is_empty() {
+        ui.label(single(
+            "まだ記録がありません。分隊のメンバーが抜けたときに記録します。",
+            13.0,
+            MUTED,
+            scale,
+        ));
+        return;
+    }
+    let row = ui.fonts_mut(|fonts| fonts.layout_job(single("M", 14.0, TEXT, scale)).size().y)
+        + scale.px(6.0);
+    ScrollArea::vertical()
+        .id_salt("history")
+        .auto_shrink(false)
+        .show_rows(ui, row, history.len(), |ui, range| {
+            for entry in &history[range] {
+                if show_history_row(ui, entry, shown.chosen.as_ref(), scale) {
+                    shown.chosen = Some(entry.clone());
+                }
+            }
+        });
+}
+
+/// One player of the history: who they were, and when the squad came apart. Says whether it
+/// has just been asked for.
+fn show_history_row(
+    ui: &mut egui::Ui,
+    entry: &HistoryEntry,
+    chosen: Option<&HistoryEntry>,
+    scale: Scale,
+) -> bool {
+    let open =
+        chosen.is_some_and(|chosen| chosen.at == entry.at && chosen.view.name == entry.view.name);
+    let row = Frame::new()
+        .fill(if open {
+            CARD_FILL
+        } else {
+            Color32::TRANSPARENT
+        })
+        .corner_radius(CornerRadius::same(scale.px(4.0).round() as u8))
+        .inner_margin(scale.margin(6.0, 3.0))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                column(
+                    ui,
+                    single(&entry.view.name, 14.0, TEXT, scale),
+                    scale.px(NAME_WIDTH),
+                );
+                column(ui, mastery_job(&entry.view, scale), scale.px(MASTERY_WIDTH));
+                column(
+                    ui,
+                    platform_job(&entry.view, scale),
+                    scale.px(PLATFORM_WIDTH),
+                );
+                match flag_icon_bytes(&entry.view.country_code) {
+                    Some((uri, bytes)) => {
+                        ui.add(
+                            egui::Image::from_bytes(uri, bytes)
+                                .fit_to_exact_size(egui::Vec2::splat(scale.px(FLAG_SIZE))),
+                        );
+                    }
+                    None => ui.add_space(scale.px(FLAG_SIZE)),
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    whole(ui, single(&entry.when, 12.0, MUTED, scale));
+                });
+            });
+        });
+    ui.interact(
+        row.response.rect,
+        ui.id().with((entry.at, entry.view.name.as_str())),
+        Sense::click(),
+    )
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
+    .clicked()
+}
+
+/// A cell of the history's list, cut short where it does not fit its column.
+fn column(ui: &mut egui::Ui, mut job: LayoutJob, width: f32) {
+    job.wrap = TextWrapping::truncate_at_width(width);
+    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, galley.size().y), Sense::hover());
+    ui.painter().galley(rect.left_top(), galley, TEXT);
 }
 
 fn show_full_card(ui: &mut egui::Ui, row: &LoadoutView, scale: Scale) {
@@ -659,10 +1045,7 @@ fn copy_on_right_click(ui: &egui::Ui, card: egui::Rect, row: &LoadoutView) {
 /// carries on the right.
 fn show_full_identity(ui: &mut egui::Ui, row: &LoadoutView, scale: Scale) {
     ui.horizontal(|ui| {
-        whole(ui, host_job(row, scale));
-        if row.is_local {
-            whole(ui, own_mark(scale));
-        }
+        show_marks(ui, row, scale);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             whole(ui, name_job(row, scale));
         });
@@ -673,18 +1056,198 @@ fn show_full_identity(ui: &mut egui::Ui, row: &LoadoutView, scale: Scale) {
 /// are on the right.
 fn show_full_status(ui: &mut egui::Ui, row: &LoadoutView, scale: Scale) {
     ui.horizontal(|ui| {
-        whole(ui, mastery_job(row, scale));
-        whole(ui, platform_job(row, scale));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // Laid down from the right, so the last quest goes first to leave them in order.
-            for (job, tooltip) in quest_jobs(row, scale).into_iter().rev() {
-                let quest = whole(ui, job);
-                if let Some((quest, tooltip)) = quest.zip(tooltip) {
-                    quest.on_hover_text(tooltip);
-                }
-            }
-        });
+        show_standing(ui, row, scale);
+        show_quests(ui, row, scale);
     });
+}
+
+/// `HOST`, and the mark that a card is ours.
+fn show_marks(ui: &mut egui::Ui, row: &LoadoutView, scale: Scale) {
+    whole(ui, host_job(row, scale));
+    if row.is_local {
+        whole(ui, own_mark(scale));
+    }
+}
+
+/// Mastery rank and platform.
+fn show_standing(ui: &mut egui::Ui, row: &LoadoutView, scale: Scale) {
+    whole(ui, mastery_job(row, scale));
+    whole(ui, platform_job(row, scale));
+}
+
+/// How far through the quests the player is, against the right edge of a horizontal line.
+fn show_quests(ui: &mut egui::Ui, row: &LoadoutView, scale: Scale) {
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        // Laid down from the right, so the last quest goes first to leave them in order.
+        for (job, tooltip) in quest_jobs(row, scale).into_iter().rev() {
+            let quest = whole(ui, job);
+            if let Some((quest, tooltip)) = quest.zip(tooltip) {
+                quest.on_hover_text(tooltip);
+            }
+        }
+    });
+}
+
+/// A grid card's header, two lines tall and in three columns: `HOST` and the mark that the
+/// card is ours over mastery rank and platform on the left; where the peer connects from on
+/// the right, the region over the country and its flag (`place_lines`), which our own card
+/// has none of; and between them the name, one line of it as tall as the two beside it,
+/// centred on the card as far as the sides leave it room. The full card's location line and
+/// quests are not here: the one is this header's right-hand column, the other is down beside
+/// the companion (`show_grid_extras`). Each line keeps its height with nothing on it, so the
+/// name stands as tall on every card.
+fn show_grid_header(ui: &mut egui::Ui, row: &LoadoutView, scale: Scale) {
+    let height = |text: &str, size: f32| {
+        ui.fonts_mut(|fonts| fonts.layout_job(single(text, size, TEXT, scale)).size().y)
+    };
+    let marks = height("HOST", HOST_SIZE).max(height(OWN_MARK, OWN_MARK_SIZE));
+    let standing = height("M", STANDING_SIZE);
+    // Text stands about as tall as its size, so the size that makes a line `tall` is found
+    // from how tall a line comes out at the header's usual one.
+    let tall = marks + ui.spacing().item_spacing.y + standing;
+    let name_size = NAME_SIZE * tall / height("M", NAME_SIZE);
+
+    let (header, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), tall), Sense::hover());
+    let upper = egui::Rect::from_min_size(header.min, egui::vec2(header.width(), marks));
+    let lower = egui::Rect::from_min_max(
+        egui::pos2(header.min.x, header.max.y - standing),
+        header.max,
+    );
+    let (region, country) = place_lines(row);
+    let flag = flag_icon_bytes(&row.country_code);
+    // Each side is laid into its lines from its own edge, and measured, so that the name
+    // knows how much room is left between them.
+    let mut side = |line: egui::Rect, from_the_right: bool, show: &dyn Fn(&mut egui::Ui)| {
+        let layout = if from_the_right {
+            egui::Layout::right_to_left(egui::Align::Center)
+        } else {
+            egui::Layout::left_to_right(egui::Align::Center)
+        };
+        let mut column = ui.new_child(UiBuilder::new().max_rect(line).layout(layout));
+        show(&mut column);
+        column.min_rect()
+    };
+    let left = [
+        side(upper, false, &|ui| show_marks(ui, row, scale)),
+        side(lower, false, &|ui| show_standing(ui, row, scale)),
+    ];
+    let right = [
+        side(upper, true, &|ui| show_place(ui, region, scale)),
+        side(lower, true, &|ui| {
+            if let Some((uri, bytes)) = &flag {
+                ui.add(
+                    egui::Image::from_bytes(uri.clone(), bytes.clone())
+                        .fit_to_exact_size(egui::Vec2::splat(scale.px(FLAG_SIZE))),
+                );
+            }
+            show_place(ui, country, scale);
+        }),
+    ];
+
+    let gap = scale.px(GRID_COLUMN_GAP);
+    let from = left[0].right().max(left[1].right()) + gap;
+    let to = right[0].left().min(right[1].left()) - gap;
+    let mut job = name_job_at(row, name_size, scale);
+    job.wrap = TextWrapping::truncate_at_width((to - from).max(0.0));
+    let name = ui.fonts_mut(|fonts| fonts.layout_job(job));
+    // Centred on the card, unless that would run it into either side.
+    let x = (header.center().x - name.size().x / 2.0)
+        .min(to - name.size().x)
+        .max(from);
+    let y = header.center().y - name.size().y / 2.0;
+    ui.painter().galley(egui::pos2(x, y), name, TEXT);
+}
+
+/// One line of where the peer connects from, cut short where it is too long for the header's
+/// right-hand column, the whole of it then a hover away.
+fn show_place(ui: &mut egui::Ui, text: &str, scale: Scale) {
+    if text.is_empty() {
+        return;
+    }
+    let mut job = single(text, PLACE_SIZE, LOCATION, scale);
+    job.wrap = TextWrapping::truncate_at_width(scale.px(GRID_PLACE_WIDTH));
+    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+    let elided = galley.elided;
+    let (rect, response) = ui.allocate_exact_size(galley.size(), Sense::hover());
+    ui.painter().galley(rect.min, galley, LOCATION);
+    if elided {
+        response.on_hover_text(text);
+    }
+}
+
+/// Where the peer connects from, as the grid's header puts it on two lines: `(region,
+/// country)`, either empty when the geo lookup did not give it. A region that is the country
+/// itself (a city state) is said once, on the country's line beside the flag. One that only
+/// shares a word with it (Mexico City, Mexico) keeps its line: two lines have room for both.
+fn place_lines(row: &LoadoutView) -> (&str, &str) {
+    let (region, country) = (row.region.trim(), row.country.trim());
+    if region.eq_ignore_ascii_case(country) {
+        return ("", country);
+    }
+    (region, country)
+}
+
+/// The column a grid card keeps beside the companion, in two blocks. The auras on the warframe
+/// come first, labelled and named as a slot is, a second one on a line of its own beneath the
+/// first, and left out whole when there is none. The operator or drifter follows, with the
+/// focus school they have on, and then how far through the quests the player is, against the
+/// right edge — the quests belong to that block, so no rule comes between them. A rule parts
+/// the blocks only when there are auras above to part it from.
+fn show_grid_extras(ui: &mut egui::Ui, row: &LoadoutView, loadout: &Loadout, scale: Scale) {
+    let auras = auras(loadout);
+    let any_auras = !auras.is_empty();
+    for (index, (name, details)) in auras.into_iter().enumerate() {
+        let label = if index == 0 { "オーラ" } else { "" };
+        show_full_slot(ui, label, name, Some(details), scale);
+    }
+    if let Some(operator) = &loadout.operator {
+        if any_auras {
+            ui.add(egui::Separator::default().spacing(scale.px(6.0)));
+        }
+        let (focus, details) = focus(operator);
+        show_full_slot(ui, operator_label(operator), &focus, details, scale);
+    }
+    ui.horizontal(|ui| show_quests(ui, row, scale));
+}
+
+/// The auras on the warframe, each as `(name, hover details)`, named as the arsenal names
+/// them, the second slot's after the first.
+fn auras(loadout: &Loadout) -> Vec<(&str, String)> {
+    loadout
+        .auras
+        .iter()
+        .map(|key| {
+            let name = dictionary_name(key);
+            (name, format!("{name}\n{key}"))
+        })
+        .collect()
+}
+
+/// Who stands behind the warframe, as the label the line goes by.
+fn operator_label(operator: &Operator) -> &'static str {
+    if operator.drifter {
+        "漂流者"
+    } else {
+        "オペレーター"
+    }
+}
+
+/// The focus school the operator or drifter has on, as `(name, hover details)`, with `—` for
+/// none.
+fn focus(operator: &Operator) -> (String, Option<String>) {
+    match &operator.focus {
+        Some(path) => {
+            let name = dictionary_name(path);
+            (name.to_owned(), Some(format!("{name}\n{path}")))
+        }
+        None => ("—".to_owned(), None),
+    }
+}
+
+/// The name the table gives a key or path, or the end of it when the table does not know it.
+fn dictionary_name(key: &str) -> &str {
+    names::lookup(key).map_or_else(|| path_tail(key), |entry| entry.name)
 }
 
 /// The third line: the flag, then where the peer connects from. It keeps its height even on
@@ -1032,11 +1595,119 @@ mod tests {
     }
 
     #[test]
+    fn puts_where_a_peer_connects_from_on_two_lines_for_the_grid() {
+        let row = |region: &str, country: &str| LoadoutView {
+            region: region.to_owned(),
+            country: country.to_owned(),
+            ..LoadoutView::default()
+        };
+
+        assert_eq!(place_lines(&row("Tokyo", "Japan")), ("Tokyo", "Japan"));
+        assert_eq!(place_lines(&row("", "Japan")), ("", "Japan"));
+        assert_eq!(place_lines(&row("Tokyo", "")), ("Tokyo", ""));
+        // A city state is said once, on the country's line beside the flag.
+        assert_eq!(
+            place_lines(&row("Hong Kong", "Hong Kong")),
+            ("", "Hong Kong")
+        );
+        // A region that only shares a word with its country is a place of its own.
+        assert_eq!(
+            place_lines(&row("Mexico City", "Mexico")),
+            ("Mexico City", "Mexico")
+        );
+        assert_eq!(place_lines(&row("", "")), ("", ""));
+    }
+
+    #[test]
     fn leaves_a_name_without_a_companion_out() {
         let loadout = Loadout {
             companion_name: Some("Pup".to_owned()),
             ..Loadout::default()
         };
         assert_eq!(gear(&loadout)[4].0, "—");
+    }
+
+    #[test]
+    fn names_each_aura_for_a_line_of_its_own() {
+        assert!(auras(&Loadout::default()).is_empty());
+
+        // A second aura slot's follows the first; a key the table lacks keeps its end.
+        let two = Loadout {
+            auras: vec![
+                "/Lotus/Language/Mods/CritToAbilityAuraName".to_owned(),
+                "/Example/NewAuraName".to_owned(),
+            ],
+            ..Loadout::default()
+        };
+        assert_eq!(
+            auras(&two),
+            [
+                (
+                    "Growing Power",
+                    "Growing Power\n/Lotus/Language/Mods/CritToAbilityAuraName".to_owned()
+                ),
+                (
+                    "NewAuraName",
+                    "NewAuraName\n/Example/NewAuraName".to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn labels_the_operator_or_drifter_by_the_focus_they_have_on() {
+        let drifter = Operator {
+            drifter: true,
+            focus: Some("/Lotus/Upgrades/Focus/Power/PowerFocusAbility".to_owned()),
+        };
+        assert_eq!(operator_label(&drifter), "漂流者");
+        assert_eq!(
+            focus(&drifter),
+            (
+                "Zenurik".to_owned(),
+                Some("Zenurik\n/Lotus/Upgrades/Focus/Power/PowerFocusAbility".to_owned())
+            )
+        );
+
+        let operator = Operator {
+            drifter: false,
+            focus: None,
+        };
+        assert_eq!(operator_label(&operator), "オペレーター");
+        assert_eq!(focus(&operator), ("—".to_owned(), None));
+    }
+
+    #[test]
+    fn puts_every_slot_in_the_grid_once() {
+        let mut slots = GRID_GEAR
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect::<Vec<_>>();
+        slots.sort_unstable();
+        assert_eq!(slots, (0..GEAR_SLOTS.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn draws_a_grid_card_at_the_largest_step_that_fits() {
+        let designed = egui::vec2(600.0, 500.0);
+        assert_eq!(
+            fit(egui::vec2(600.0, 500.0), designed),
+            1.0,
+            "a perfect fit"
+        );
+        assert_eq!(
+            fit(egui::vec2(1200.0, 1000.0), designed),
+            2.0,
+            "twice the room"
+        );
+        // The tighter of the two decides, and a size between steps goes down to the one below.
+        assert_eq!(fit(egui::vec2(590.0, 1000.0), designed), 0.95);
+        assert_eq!(fit(egui::vec2(1200.0, 440.0), designed), 0.85);
+        assert_eq!(
+            fit(egui::vec2(60.0, 50.0), designed),
+            FIT_MIN,
+            "past reading"
+        );
     }
 }

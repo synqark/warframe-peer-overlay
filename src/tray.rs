@@ -27,6 +27,10 @@ pub enum Command {
     ShowLoadouts,
     /// Bring up the one that lists the mods on every slot.
     ShowFullLoadouts,
+    /// Bring up the one that lays six places out in two rows of three.
+    ShowGridLoadouts,
+    /// Bring up the one that keeps the players met before.
+    ShowHistory,
     Exit,
 }
 
@@ -42,17 +46,23 @@ fn run(on_command: impl Fn(Command)) {
     let menu = Menu::new();
     let loadouts = MenuItem::new("Loadouts", true, None);
     let full_loadouts = MenuItem::new("Loadouts (full)", true, None);
+    let grid_loadouts = MenuItem::new("Loadouts (6grid)", true, None);
+    let history = MenuItem::new("History", true, None);
     let exit = MenuItem::new("Exit", true, None);
     menu.append_items(&[
         &loadouts,
         &full_loadouts,
+        &grid_loadouts,
+        &history,
         &PredefinedMenuItem::separator(),
         &exit,
     ])
     .expect("failed to build tray menu");
-    let (loadouts_id, full_loadouts_id, exit_id) = (
+    let (loadouts_id, full_loadouts_id, grid_loadouts_id, history_id, exit_id) = (
         loadouts.id().clone(),
         full_loadouts.id().clone(),
+        grid_loadouts.id().clone(),
+        history.id().clone(),
         exit.id().clone(),
     );
 
@@ -77,6 +87,10 @@ fn run(on_command: impl Fn(Command)) {
                     on_command(Command::ShowLoadouts);
                 } else if event.id == full_loadouts_id {
                     on_command(Command::ShowFullLoadouts);
+                } else if event.id == grid_loadouts_id {
+                    on_command(Command::ShowGridLoadouts);
+                } else if event.id == history_id {
+                    on_command(Command::ShowHistory);
                 } else if event.id == exit_id {
                     on_command(Command::Exit);
                     return;
@@ -86,7 +100,7 @@ fn run(on_command: impl Fn(Command)) {
     }
 }
 
-/// The project's icon as `(rgba, width, height)`: the tray's, and the loadout window's too.
+/// The project's icon as `(rgba, width, height)`: the tray's, and the loadout windows' too.
 pub fn icon_rgba() -> (Vec<u8>, u32, u32) {
     // Embedded rather than read at runtime so the release build stays a single portable
     // exe with no assets directory to ship alongside it. The artwork is original — no

@@ -1,4 +1,5 @@
 pub mod geo;
+pub mod history;
 pub mod loadout;
 pub mod monitor;
 pub mod names;

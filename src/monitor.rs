@@ -4,11 +4,15 @@ use std::{
     fs::{self, File},
     io::{Read, Seek, SeekFrom},
     path::PathBuf,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, Sender},
+    },
     thread,
     time::Duration,
 };
 
+use serde::{Deserialize, Serialize};
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, POINT, RECT},
@@ -20,7 +24,8 @@ use windows_sys::Win32::{
 
 use crate::{
     geo::{GeoInfo, GeoResolver, country_name},
-    loadout::{self, CaptureRequest, Captured, Job, Loadout, OwnRequest, RawJson},
+    history::{History, HistoryEntry},
+    loadout::{self, CaptureRequest, Captured, Job, Loadout, OwnRequest, RawJson, UpdateRequest},
     parser::{LogParser, Peer},
 };
 
@@ -46,8 +51,9 @@ pub struct WindowRect {
     pub height: i32,
 }
 
-/// One card of the loadout window.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// One card of the loadout window, and what the history keeps of a player.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LoadoutView {
     pub name: String,
     pub platform: String,
@@ -61,7 +67,10 @@ pub struct LoadoutView {
     pub region: String,
     /// `None` until captured, which for some members never happens (see README).
     pub loadout: Option<Loadout>,
-    /// The whole of what was captured, for the windows to hand out; empty until then.
+    /// The whole of what was captured, for the windows to hand out; empty until then. The
+    /// history leaves it out of what it writes down: tens of kilobytes a player would run to
+    /// tens of megabytes, and the copies saved under `loadouts` have it already.
+    #[serde(skip)]
     pub json: RawJson,
 }
 
@@ -74,6 +83,8 @@ pub struct MonitorSnapshot {
     pub window_rect: Option<WindowRect>,
     /// The loadout window's cards: ours first, then each member still in the squad.
     pub loadouts: Vec<LoadoutView>,
+    /// Players from squads gone by, newest first.
+    pub history: Arc<[HistoryEntry]>,
 }
 
 pub fn spawn(geo_enabled: bool) -> Receiver<MonitorSnapshot> {
@@ -94,7 +105,20 @@ fn run(sender: Sender<MonitorSnapshot>, geo_enabled: bool) {
     // By name and announced size, so a member who re-joins with other gear is not shown the
     // old one while the new one is looked for.
     let mut member_loadouts = HashMap::<(String, usize), (Loadout, RawJson)>::new();
+    // A member's loadout as changed since they joined, by name: it stands in for the one their
+    // JOIN announced until they leave, or a JOIN brings a newer one.
+    let mut member_updates = HashMap::<String, (Loadout, RawJson)>::new();
+    let mut seen_updates = HashMap::<String, u32>::new();
+    // What each member's loadout was saved as, by name, until they leave and it is written down
+    // with them. Until then it is what spares the file from a clear-out.
+    let mut saved = HashMap::<String, String>::new();
     let mut own_loadout: Option<LoadoutView> = None;
+    let mut history = History::load();
+    discard_what_nothing_shows(&history, &saved);
+    let mut written_down = Arc::<[HistoryEntry]>::from(history.entries());
+    // The squad as the last pass round saw it, to tell who has left it since.
+    let mut squad = HashMap::<String, LoadoutView>::new();
+    let mut departures = 0_u64;
     let mut seen_own_builds = 0;
     let mut seen_other_builds = 0;
     let mut file_position = 0;
@@ -128,6 +152,8 @@ fn run(sender: Sender<MonitorSnapshot>, geo_enabled: bool) {
             geo_failures.clear();
             requested_loadouts.clear();
             member_loadouts.clear();
+            member_updates.clear();
+            seen_updates.clear();
             file_position = 0;
             pending.clear();
         }
@@ -154,6 +180,11 @@ fn run(sender: Sender<MonitorSnapshot>, geo_enabled: bool) {
             ) {
                 let _ = loadouts.send(Job::Member(request));
             }
+            for request in
+                update_requests(parser.peers(), parser.local_user(), pid, &mut seen_updates)
+            {
+                let _ = loadouts.send(Job::Update(request));
+            }
             if let Some(request) = own_request(&parser, pid, &mut seen_own_builds) {
                 let _ = loadouts.send(Job::Own(request));
             }
@@ -168,8 +199,25 @@ fn run(sender: Sender<MonitorSnapshot>, geo_enabled: bool) {
                     bytes,
                     loadout,
                     json,
+                    file,
                 } => {
+                    if let Some(file) = file {
+                        saved.insert(name.clone(), file);
+                    }
+                    // A JOIN captured now is newer than any change seen before it.
+                    member_updates.remove(&name);
                     member_loadouts.insert((name, bytes), (loadout, json));
+                }
+                Captured::Update {
+                    name,
+                    loadout,
+                    json,
+                    file,
+                } => {
+                    if let Some(file) = file {
+                        saved.insert(name.clone(), file);
+                    }
+                    member_updates.insert(name, (loadout, json));
                 }
                 Captured::Own {
                     name,
@@ -224,8 +272,42 @@ fn run(sender: Sender<MonitorSnapshot>, geo_enabled: bool) {
                 }
             })
             .collect::<Vec<_>>();
-        let loadout_cards = loadout_views(&parser, &peers, own_loadout.as_ref(), &member_loadouts);
-        let signature = format!("{running}:{status}:{peers:?}:{window_rect:?}:{loadout_cards:?}");
+        let loadout_cards = loadout_views(
+            &parser,
+            &peers,
+            own_loadout.as_ref(),
+            &member_loadouts,
+            &member_updates,
+        );
+        // Whoever was in the squad a pass ago and is not in it now has left: that is the
+        // moment everything about them is known, so that is when they are written down. Those
+        // whose loadout was never captured are let go, being a name and little else.
+        let members: HashMap<String, LoadoutView> = loadout_cards
+            .iter()
+            .filter(|view| !view.is_local)
+            .map(|view| (view.name.clone(), view.clone()))
+            .collect();
+        // A change seen while they were here is no longer theirs to show if they come back:
+        // whoever joins again is shown what their JOIN announces, until they change it again.
+        member_updates.retain(|name, _| !squad.contains_key(name) || members.contains_key(name));
+        let left = squad
+            .values()
+            .filter(|view| !members.contains_key(&view.name) && view.loadout.is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        if !left.is_empty() {
+            departures += left.len() as u64;
+            for view in left {
+                let file = saved.remove(&view.name).unwrap_or_default();
+                history.record(view, file);
+            }
+            history.save();
+            written_down = Arc::from(history.entries());
+            discard_what_nothing_shows(&history, &saved);
+        }
+        squad = members;
+        let signature =
+            format!("{running}:{status}:{peers:?}:{window_rect:?}:{loadout_cards:?}:{departures}");
         if signature != last_signature {
             if sender
                 .send(MonitorSnapshot {
@@ -235,6 +317,7 @@ fn run(sender: Sender<MonitorSnapshot>, geo_enabled: bool) {
                     peers,
                     window_rect,
                     loadouts: loadout_cards,
+                    history: Arc::clone(&written_down),
                 })
                 .is_err()
             {
@@ -271,6 +354,32 @@ fn capture_requests(
         .collect()
 }
 
+/// A member's loadout is worth looking for again whenever EE.log shows them sending it to the
+/// squad anew. Right after start-up that is once for every member who changed theirs, as the
+/// log replay counts every message so far. A count that went down belongs to a squad formed
+/// afresh since: it is only taken in.
+fn update_requests(
+    peers: &[Peer],
+    local_user: Option<&str>,
+    pid: u32,
+    seen: &mut HashMap<String, u32>,
+) -> Vec<UpdateRequest> {
+    peers
+        .iter()
+        .filter(|peer| local_user != Some(peer.name.as_str()))
+        .filter_map(|peer| {
+            let before = seen
+                .insert(peer.name.clone(), peer.loadout_updates)
+                .unwrap_or_default();
+            (peer.loadout_updates > before).then(|| UpdateRequest {
+                pid,
+                name: peer.name.clone(),
+                platform: peer.platform,
+            })
+        })
+        .collect()
+}
+
 /// Our own loadout is worth capturing again whenever EE.log shows it being rebuilt. Right
 /// after start-up that is immediately, as the log replay counts every rebuild so far.
 fn own_request(parser: &LogParser, pid: u32, seen_builds: &mut u64) -> Option<OwnRequest> {
@@ -286,13 +395,27 @@ fn own_request(parser: &LogParser, pid: u32, seen_builds: &mut u64) -> Option<Ow
     })
 }
 
+/// Clears the loadouts folder of what nothing can show any more. What the history can still
+/// lay out is kept, and so is what has been captured for a squad still together — its members
+/// are written down only once they leave.
+fn discard_what_nothing_shows(history: &History, saved: &HashMap<String, String>) {
+    let kept: HashSet<&str> = history
+        .files()
+        .chain(saved.values().map(String::as_str))
+        .collect();
+    loadout::discard_unkept(&kept, history.horizon());
+}
+
 /// The loadout window's cards: ours always first, then every member still in the squad, in
-/// the order they joined. A member whose loadout is not captured still gets a card.
+/// the order they joined. A member whose loadout is not captured still gets a card. A member
+/// is shown the loadout they changed to since joining, when there is one (`updates`), and the
+/// one their JOIN announced otherwise.
 fn loadout_views(
     parser: &LogParser,
     peers: &[PeerView],
     own: Option<&LoadoutView>,
     members: &HashMap<(String, usize), (Loadout, RawJson)>,
+    updates: &HashMap<String, (Loadout, RawJson)>,
 ) -> Vec<LoadoutView> {
     let local_user = parser.local_user();
     let mut own = own.cloned().unwrap_or_else(|| LoadoutView {
@@ -315,9 +438,10 @@ fn loadout_views(
         .zip(peers)
         .filter(|(peer, _)| local_user != Some(peer.name.as_str()))
         .map(|(peer, view)| {
-            let captured = peer
-                .loadout_bytes
-                .and_then(|bytes| members.get(&(peer.name.clone(), bytes)));
+            let captured = updates.get(&peer.name).or_else(|| {
+                peer.loadout_bytes
+                    .and_then(|bytes| members.get(&(peer.name.clone(), bytes)))
+            });
             LoadoutView {
                 name: peer.name.clone(),
                 platform: peer.platform.label().to_owned(),
@@ -493,6 +617,44 @@ mod tests {
     }
 
     #[test]
+    fn asks_after_a_members_loadout_each_time_they_send_it_again() {
+        let peer = |name: &str, updates: u32| Peer {
+            name: name.to_owned(),
+            loadout_updates: updates,
+            ..Peer::default()
+        };
+        let mut seen = HashMap::new();
+        let names = |requests: Vec<UpdateRequest>| {
+            requests
+                .into_iter()
+                .map(|request| request.name)
+                .collect::<Vec<_>>()
+        };
+
+        // At start the replayed log has counted every change so far: one look each.
+        let peers = [peer("LocalTenno", 3), peer("Tenno", 2), peer("Lotus", 0)];
+        assert_eq!(
+            names(update_requests(&peers, Some("LocalTenno"), 42, &mut seen)),
+            ["Tenno"]
+        );
+        assert!(update_requests(&peers, Some("LocalTenno"), 42, &mut seen).is_empty());
+
+        let peers = [peer("Tenno", 3), peer("Lotus", 1)];
+        assert_eq!(
+            names(update_requests(&peers, Some("LocalTenno"), 42, &mut seen)),
+            ["Tenno", "Lotus"]
+        );
+        // A squad formed afresh counts from nothing again; only a message after that counts.
+        let peers = [peer("Tenno", 0)];
+        assert!(update_requests(&peers, Some("LocalTenno"), 42, &mut seen).is_empty());
+        let peers = [peer("Tenno", 1)];
+        assert_eq!(
+            names(update_requests(&peers, Some("LocalTenno"), 42, &mut seen)),
+            ["Tenno"]
+        );
+    }
+
+    #[test]
     fn notes_another_players_rebuild_once() {
         let mut parser = LogParser::default();
         let mut seen = 0;
@@ -568,7 +730,8 @@ mod tests {
             (("Lotus".to_owned(), 300), (captured.clone(), json)),
         ]);
 
-        let views = loadout_views(&parser, &peer_views(&parser), None, &members);
+        let no_updates = HashMap::new();
+        let views = loadout_views(&parser, &peer_views(&parser), None, &members, &no_updates);
         assert_eq!(
             cards(&views),
             [
@@ -576,6 +739,27 @@ mod tests {
                 ("Tenno", false, true),
                 ("Lotus", false, false)
             ]
+        );
+        // A loadout changed since joining stands in for the announced one, and a member who
+        // announced none is shown theirs all the same.
+        let changed = Loadout {
+            mastery_rank: Some(6),
+            ..Loadout::default()
+        };
+        let updates = HashMap::from([
+            ("Tenno".to_owned(), (changed.clone(), RawJson::default())),
+            ("Lotus".to_owned(), (changed, RawJson::default())),
+        ]);
+        let updated = loadout_views(&parser, &peer_views(&parser), None, &members, &updates);
+        assert_eq!(
+            updated
+                .iter()
+                .map(|view| view
+                    .loadout
+                    .as_ref()
+                    .and_then(|loadout| loadout.mastery_rank))
+                .collect::<Vec<_>>(),
+            [None, Some(6), Some(6)]
         );
         assert_eq!(views[0].platform, "PC");
         // The whole of a member's loadout rides along, for a window to hand out.
@@ -614,7 +798,8 @@ mod tests {
                 &parser,
                 &peer_views(&parser),
                 Some(&own),
-                &members
+                &members,
+                &no_updates
             )),
             [("LocalTenno", true, true), ("Lotus", false, false)]
         );

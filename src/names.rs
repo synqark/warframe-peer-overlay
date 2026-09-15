@@ -3,7 +3,9 @@
 //! The table comes from the warframe-public-export-plus submodule, which `build.rs` turns into
 //! one line per named item (`path \t export \t part type \t name`) for `include_str!`. It
 //! covers every export a loadout draws on, in the language `build.rs` picks, and is indexed on
-//! first use. Built without the submodule, it is empty and every lookup comes back `None`.
+//! first use. A few lines are looked up by something other than an item's path, as a loadout
+//! names them: an aura by its dictionary key, a focus school by its ability's path (see
+//! `Kind`). Built without the submodule, it is empty and every lookup comes back `None`.
 
 use std::{collections::HashMap, sync::OnceLock};
 
@@ -44,6 +46,11 @@ pub enum Kind {
     Focus,
     /// Operator and drifter gear.
     Virtual,
+    /// An aura, looked up by the dictionary key a loadout's `AuraName` gives rather than by
+    /// its mod's path.
+    Aura,
+    /// A focus school, looked up by the path a loadout's `FocusAbility` gives.
+    FocusSchool,
 }
 
 impl Kind {
@@ -62,6 +69,8 @@ impl Kind {
             "Avionics" => Self::Avionic,
             "FocusUpgrades" => Self::Focus,
             "Virtuals" => Self::Virtual,
+            "Auras" => Self::Aura,
+            "FocusSchools" => Self::FocusSchool,
             _ => return None,
         })
     }
@@ -164,6 +173,26 @@ mod tests {
         assert_eq!(
             entry("/Lotus/Upgrades/Skins/Deluxe/AlchemistDeluxeShotgunSkin").kind,
             Kind::Cosmetic
+        );
+    }
+
+    #[test]
+    fn names_auras_by_their_key_and_focus_schools_by_their_ability() {
+        let growing_power = entry("/Lotus/Language/Mods/CritToAbilityAuraName");
+        assert_eq!(
+            (growing_power.kind, growing_power.name),
+            (Kind::Aura, "Growing Power")
+        );
+        // An aura from before auras were mods of their own is named the same way.
+        assert_eq!(
+            entry("/Lotus/Language/Items/PlayerHealthBuffName").name,
+            "Physique"
+        );
+        let zenurik = entry("/Lotus/Upgrades/Focus/Power/PowerFocusAbility");
+        assert_eq!((zenurik.kind, zenurik.name), (Kind::FocusSchool, "Zenurik"));
+        assert_eq!(
+            entry("/Lotus/Upgrades/Focus/Ward/WardFocusAbility").name,
+            "Unairu"
         );
     }
 

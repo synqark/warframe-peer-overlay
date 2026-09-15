@@ -30,7 +30,7 @@ serde_json = { version = "1.0", features = ["preserve_order"] }
 sysinfo = "0.39.6"
 tray-icon = "0.24.2"
 # Diagnostics_Debug and Memory: read-only access to the game's memory for loadout capture.
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_Diagnostics_Debug", "Win32_System_Memory", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_Diagnostics_Debug", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 winit = "0.30.13"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 tauri-winrt-notification = "0.8.1"
