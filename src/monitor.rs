@@ -108,7 +108,7 @@ fn run(sender: Sender<MonitorSnapshot>, geo_enabled: bool) {
     // A member's loadout as changed since they joined, by name: it stands in for the one their
     // JOIN announced until they leave, or a JOIN brings a newer one.
     let mut member_updates = HashMap::<String, (Loadout, RawJson)>::new();
-    let mut seen_updates = HashMap::<String, u32>::new();
+    let mut seen_loadout_messages = 0;
     // What each member's loadout was saved as, by name, until they leave and it is written down
     // with them. Until then it is what spares the file from a clear-out.
     let mut saved = HashMap::<String, String>::new();
@@ -153,7 +153,6 @@ fn run(sender: Sender<MonitorSnapshot>, geo_enabled: bool) {
             requested_loadouts.clear();
             member_loadouts.clear();
             member_updates.clear();
-            seen_updates.clear();
             file_position = 0;
             pending.clear();
         }
@@ -180,9 +179,7 @@ fn run(sender: Sender<MonitorSnapshot>, geo_enabled: bool) {
             ) {
                 let _ = loadouts.send(Job::Member(request));
             }
-            for request in
-                update_requests(parser.peers(), parser.local_user(), pid, &mut seen_updates)
-            {
+            for request in update_requests(&parser, pid, &mut seen_loadout_messages) {
                 let _ = loadouts.send(Job::Update(request));
             }
             if let Some(request) = own_request(&parser, pid, &mut seen_own_builds) {
@@ -354,28 +351,24 @@ fn capture_requests(
         .collect()
 }
 
-/// A member's loadout is worth looking for again whenever EE.log shows them sending it to the
-/// squad anew. Right after start-up that is once for every member who changed theirs, as the
-/// log replay counts every message so far. A count that went down belongs to a squad formed
-/// afresh since: it is only taken in.
-fn update_requests(
-    peers: &[Peer],
-    local_user: Option<&str>,
-    pid: u32,
-    seen: &mut HashMap<String, u32>,
-) -> Vec<UpdateRequest> {
-    peers
+/// Every member's loadout is worth looking for again whenever EE.log shows a member sending
+/// theirs to the squad anew: the line cannot say whose it is (see
+/// `LogParser::loadout_messages`), and a member who changed nothing is soon told apart, their
+/// records having moved nowhere. Right after start-up that is immediately, as the log replay
+/// counts every message so far.
+fn update_requests(parser: &LogParser, pid: u32, seen_messages: &mut u64) -> Vec<UpdateRequest> {
+    if parser.loadout_messages() == *seen_messages {
+        return Vec::new();
+    }
+    *seen_messages = parser.loadout_messages();
+    parser
+        .peers()
         .iter()
-        .filter(|peer| local_user != Some(peer.name.as_str()))
-        .filter_map(|peer| {
-            let before = seen
-                .insert(peer.name.clone(), peer.loadout_updates)
-                .unwrap_or_default();
-            (peer.loadout_updates > before).then(|| UpdateRequest {
-                pid,
-                name: peer.name.clone(),
-                platform: peer.platform,
-            })
+        .filter(|peer| parser.local_user() != Some(peer.name.as_str()))
+        .map(|peer| UpdateRequest {
+            pid,
+            name: peer.name.clone(),
+            platform: peer.platform,
         })
         .collect()
 }
@@ -617,41 +610,37 @@ mod tests {
     }
 
     #[test]
-    fn asks_after_a_members_loadout_each_time_they_send_it_again() {
-        let peer = |name: &str, updates: u32| Peer {
-            name: name.to_owned(),
-            loadout_updates: updates,
-            ..Peer::default()
-        };
-        let mut seen = HashMap::new();
+    fn asks_after_every_member_whenever_a_loadout_is_sent_again() {
+        let mut parser = LogParser::default();
+        let mut seen = 0;
         let names = |requests: Vec<UpdateRequest>| {
             requests
                 .into_iter()
                 .map(|request| request.name)
                 .collect::<Vec<_>>()
         };
-
-        // At start the replayed log has counted every change so far: one look each.
-        let peers = [peer("LocalTenno", 3), peer("Tenno", 2), peer("Lotus", 0)];
-        assert_eq!(
-            names(update_requests(&peers, Some("LocalTenno"), 42, &mut seen)),
-            ["Tenno"]
+        for line in [
+            "1 Sys [Info]: Logged in LocalTenno",
+            "2 Net [Info]: AddSquadMember: Tenno\u{e000}, mm=a, squadCount=1",
+            "3 Net [Info]: AddSquadMember: LocalTenno\u{e000}, mm=local, squadCount=2",
+            "4 Net [Info]: AddSquadMember: Lotus\u{e000}, mm=b, squadCount=3",
+        ] {
+            parser.process_line(line);
+        }
+        assert!(
+            update_requests(&parser, 42, &mut seen).is_empty(),
+            "nobody has sent one"
         );
-        assert!(update_requests(&peers, Some("LocalTenno"), 42, &mut seen).is_empty());
 
-        let peers = [peer("Tenno", 3), peer("Lotus", 1)];
+        // Relayed by the host, the line names nobody: everyone but us is looked at, once.
+        parser.process_line(
+            "5 Game [Info]: HandleSquadMessage from 203.0.113.9:56152 LOADOUT (host: 0)",
+        );
         assert_eq!(
-            names(update_requests(&peers, Some("LocalTenno"), 42, &mut seen)),
+            names(update_requests(&parser, 42, &mut seen)),
             ["Tenno", "Lotus"]
         );
-        // A squad formed afresh counts from nothing again; only a message after that counts.
-        let peers = [peer("Tenno", 0)];
-        assert!(update_requests(&peers, Some("LocalTenno"), 42, &mut seen).is_empty());
-        let peers = [peer("Tenno", 1)];
-        assert_eq!(
-            names(update_requests(&peers, Some("LocalTenno"), 42, &mut seen)),
-            ["Tenno"]
-        );
+        assert!(update_requests(&parser, 42, &mut seen).is_empty());
     }
 
     #[test]

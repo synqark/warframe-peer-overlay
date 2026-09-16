@@ -12,10 +12,6 @@ pub struct Peer {
     /// Size of the loadout EE.log announced when this member joined, used to find it in
     /// the game's memory.
     pub loadout_bytes: Option<usize>,
-    /// How many times this member has sent the squad their loadout again since joining
-    /// (`HandleSquadMessage from <address> LOADOUT`): each change in their arsenal, and
-    /// leaving it. The line names no size, so the new one is found by who it belongs to.
-    pub loadout_updates: u32,
 }
 
 impl Platform {
@@ -65,9 +61,7 @@ pub struct LogParser {
     matchmaking_ips: HashMap<String, String>,
     ping_ips_by_name: HashMap<String, String>,
     loadout_bytes_by_name: HashMap<String, usize>,
-    /// `LOADOUT` messages by the address they came from, which names nobody: they are put to
-    /// a member once an address line has tied the two together, as ping IPs are.
-    loadout_updates_by_ip: HashMap<String, u32>,
+    loadout_messages: u64,
     host_ip: Option<String>,
     local_user: Option<String>,
     local_platform: Platform,
@@ -103,10 +97,8 @@ impl Default for LogParser {
             .expect("valid squad JOIN regex"),
             build_loadout: Regex::new(r"Sys \[Info\]: BuildLoadOut for (.+?)\s*$")
                 .expect("valid BuildLoadOut regex"),
-            loadout_message: Regex::new(
-                r"Game \[Info\]: HandleSquadMessage from ([\d.]+):\d+ LOADOUT\b",
-            )
-            .expect("valid LOADOUT message regex"),
+            loadout_message: Regex::new(r"Game \[Info\]: HandleSquadMessage from \S+ LOADOUT\b")
+                .expect("valid LOADOUT message regex"),
             received_ping: Regex::new(
                 r"Net \[Info\]: Received ping from ([\d.]+):\d+ \((.+?) - \d+ms\)",
             )
@@ -115,7 +107,7 @@ impl Default for LogParser {
             matchmaking_ips: HashMap::new(),
             ping_ips_by_name: HashMap::new(),
             loadout_bytes_by_name: HashMap::new(),
-            loadout_updates_by_ip: HashMap::new(),
+            loadout_messages: 0,
             host_ip: None,
             local_user: None,
             local_platform: Platform::Unknown,
@@ -145,6 +137,16 @@ impl LogParser {
         self.own_builds
     }
 
+    /// How many times a squad member has sent the squad their loadout again since joining
+    /// (`HandleSquadMessage from <address> LOADOUT`): each change in their arsenal, and leaving
+    /// it. The line tells neither whose it is nor how long: its address is the member's own only
+    /// while we host, and otherwise the host's, which relays every member's messages. So it is
+    /// counted for the squad as a whole, and every member is looked at again when it moves.
+    /// Not reset by `clear()`.
+    pub fn loadout_messages(&self) -> u64 {
+        self.loadout_messages
+    }
+
     /// How many times EE.log has shown somebody else's loadout being rebuilt. The game builds
     /// squad members' loadouts locally too (`BuildLoadOut for <member>`), and each build leaves
     /// a version of theirs in the game's memory, where it can pass for a fresh one of ours.
@@ -157,7 +159,6 @@ impl LogParser {
         self.matchmaking_ips.clear();
         self.ping_ips_by_name.clear();
         self.loadout_bytes_by_name.clear();
-        self.loadout_updates_by_ip.clear();
         self.host_ip = None;
     }
 
@@ -214,12 +215,9 @@ impl LogParser {
             return self.reconcile();
         }
 
-        if let Some(captures) = self.loadout_message.captures(line) {
-            *self
-                .loadout_updates_by_ip
-                .entry(captures[1].to_owned())
-                .or_default() += 1;
-            return self.reconcile();
+        if self.loadout_message.is_match(line) {
+            self.loadout_messages += 1;
+            return false;
         }
 
         if let Some(captures) = self.build_loadout.captures(line) {
@@ -277,20 +275,10 @@ impl LogParser {
             let is_host = (ip.is_some() && ip == self.host_ip)
                 || (!has_remote_host && self.local_user.as_deref() == Some(peer.name.as_str()));
             let loadout_bytes = self.loadout_bytes_by_name.get(&peer.name).copied();
-            let loadout_updates = ip
-                .as_ref()
-                .and_then(|ip| self.loadout_updates_by_ip.get(ip))
-                .copied()
-                .unwrap_or_default();
-            if peer.ip != ip
-                || peer.is_host != is_host
-                || peer.loadout_bytes != loadout_bytes
-                || peer.loadout_updates != loadout_updates
-            {
+            if peer.ip != ip || peer.is_host != is_host || peer.loadout_bytes != loadout_bytes {
                 peer.ip = ip;
                 peer.is_host = is_host;
                 peer.loadout_bytes = loadout_bytes;
-                peer.loadout_updates = loadout_updates;
                 changed = true;
             }
         }
@@ -343,7 +331,6 @@ mod tests {
                 ip: Some("203.0.113.7".to_owned()),
                 is_host: true,
                 loadout_bytes: None,
-                loadout_updates: 0,
             }]
         );
     }
@@ -450,34 +437,29 @@ mod tests {
     }
 
     #[test]
-    fn counts_the_loadouts_each_member_sends_again_by_their_address() {
+    fn counts_the_loadouts_members_send_again_whoever_relays_them() {
         let mut parser = LogParser::default();
-        // A message from an address no line has tied to anyone yet waits for one.
+        parser.process_line("1 Net [Info]: AddSquadMember: Tenno\u{e000}, mm=peer-a, squadCount=2");
         parser.process_line(
-            "1 Game [Info]: HandleSquadMessage from 198.51.100.4:4955 LOADOUT (host: 1)",
+            "2 Net [Info]: VOIP: Registered remote player peer-a (198.51.100.4:4955)",
         );
-        parser.process_line("2 Net [Info]: AddSquadMember: Tenno\u{e000}, mm=peer-a, squadCount=2");
-        parser.process_line("3 Net [Info]: AddSquadMember: Lotus\u{e000}, mm=peer-b, squadCount=3");
+        // Straight from the member, while we host…
         parser.process_line(
-            "4 Net [Info]: VOIP: Registered remote player peer-a (198.51.100.4:4955)",
+            "3 Game [Info]: HandleSquadMessage from 198.51.100.4:4955 LOADOUT (host: 1)",
         );
-        assert!(
-            parser.process_line(
-                "5 Game [Info]: HandleSquadMessage from 198.51.100.4:4955 LOADOUT (host: 1)"
-            ),
-            "a member's loadout changing changes the squad"
-        );
-        // Other squad messages from the same address are not loadouts.
+        // …and relayed by a host who is somebody else, from an address that is not theirs.
         parser.process_line(
-            "6 Game [Info]: HandleSquadMessage from 198.51.100.4:4955 GENERIC_SQUAD_MESSAGE (host: 1)",
+            "4 Game [Info]: HandleSquadMessage from 203.0.113.9:56152 LOADOUT (host: 0)",
         );
+        // Other squad messages are not loadouts.
+        parser.process_line(
+            "5 Game [Info]: HandleSquadMessage from 203.0.113.9:56152 GENERIC_SQUAD_MESSAGE (host: 0)",
+        );
+        assert_eq!(parser.loadout_messages(), 2);
 
-        let updates = parser
-            .peers()
-            .iter()
-            .map(|peer| (peer.name.as_str(), peer.loadout_updates))
-            .collect::<Vec<_>>();
-        assert_eq!(updates, [("Tenno", 2), ("Lotus", 0)]);
+        // A squad breaking up leaves the count as it is, for the monitor to go on from.
+        parser.process_line("6 Net [Info]: MatchingService::LeaveSquad");
+        assert_eq!(parser.loadout_messages(), 2);
     }
 
     #[test]
