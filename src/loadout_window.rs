@@ -121,6 +121,9 @@ const HOST_SIZE: f32 = 13.0;
 const OWN_MARK: &str = "自分";
 const OWN_MARK_SIZE: f32 = 11.0;
 const STANDING_SIZE: f32 = 14.0;
+/// How much of the room it has a grid card's name is drawn at: a little under it, and in
+/// italics, so that a name standing as tall as the two lines beside it does not crowd them.
+const GRID_NAME_SCALE: f32 = 0.9;
 const MOD_COLOR: Color32 = Color32::from_rgb(168, 178, 192);
 /// A tall card's content width: four cards, with their margins, the space between them, the
 /// window's own margins and room for the scroll bar, fit the 1440 the full window opens at.
@@ -526,6 +529,15 @@ fn header(row: &LoadoutView, scale: Scale) -> Vec<(LayoutJob, Option<String>)> {
 /// The player's name, in gold when the card is ours.
 fn name_job(row: &LoadoutView, scale: Scale) -> LayoutJob {
     name_job_at(row, NAME_SIZE, scale)
+}
+
+/// The name on a grid card: `GRID_NAME_SCALE` of the room its line has, and in italics.
+fn grid_name_job(row: &LoadoutView, room: f32, scale: Scale) -> LayoutJob {
+    let mut job = name_job_at(row, room * GRID_NAME_SCALE, scale);
+    for section in &mut job.sections {
+        section.format.italics = true;
+    }
+    job
 }
 
 fn name_job_at(row: &LoadoutView, size: f32, scale: Scale) -> LayoutJob {
@@ -1148,7 +1160,7 @@ fn show_grid_header(ui: &mut egui::Ui, row: &LoadoutView, scale: Scale) {
     let gap = scale.px(GRID_COLUMN_GAP);
     let from = left[0].right().max(left[1].right()) + gap;
     let to = right[0].left().min(right[1].left()) - gap;
-    let mut job = name_job_at(row, name_size, scale);
+    let mut job = grid_name_job(row, name_size, scale);
     job.wrap = TextWrapping::truncate_at_width((to - from).max(0.0));
     let name = ui.fonts_mut(|fonts| fonts.layout_job(job));
     // Centred on the card, unless that would run it into either side.
@@ -1675,6 +1687,19 @@ mod tests {
         };
         assert_eq!(operator_label(&operator), "オペレーター");
         assert_eq!(focus(&operator), ("—".to_owned(), None));
+    }
+
+    #[test]
+    fn writes_a_grid_cards_name_a_little_smaller_and_slanted() {
+        let row = LoadoutView {
+            name: "Tenno".to_owned(),
+            ..LoadoutView::default()
+        };
+        let job = grid_name_job(&row, 30.0, Scale(1.0));
+        let format = &job.sections[0].format;
+
+        assert_eq!(format.font_id.size, 27.0);
+        assert!(format.italics);
     }
 
     #[test]
