@@ -5,7 +5,9 @@
 //! covers every export a loadout draws on, in the language `build.rs` picks, and is indexed on
 //! first use. A few lines are looked up by something other than an item's path, as a loadout
 //! names them: an aura by its dictionary key, a focus school by its ability's path (see
-//! `Kind`). Built without the submodule, it is empty and every lookup comes back `None`.
+//! `Kind`). The nodes of the star chart and the mission types are in it too, by the ids
+//! EE.log gives them (`node_name`, `mission_type_name`). Built without the submodule, it is
+//! empty and every lookup comes back `None`.
 
 use std::{collections::HashMap, sync::OnceLock};
 
@@ -51,6 +53,10 @@ pub enum Kind {
     Aura,
     /// A focus school, looked up by the path a loadout's `FocusAbility` gives.
     FocusSchool,
+    /// A node of the star chart, looked up by its id (`SolNode228`).
+    Region,
+    /// A mission type, looked up by its id (`MT_LANDSCAPE`).
+    MissionType,
 }
 
 impl Kind {
@@ -71,6 +77,8 @@ impl Kind {
             "Virtuals" => Self::Virtual,
             "Auras" => Self::Aura,
             "FocusSchools" => Self::FocusSchool,
+            "Regions" => Self::Region,
+            "MissionTypes" => Self::MissionType,
             _ => return None,
         })
     }
@@ -97,6 +105,35 @@ pub fn item_name(path: &str, parts: &[String]) -> Option<&'static str> {
         .find(|entry| entry.part.is_some_and(|slot| NAMING_PARTS.contains(&slot)))
         .or_else(|| lookup(path))
         .map(|entry| entry.name)
+}
+
+/// A node of the star chart by the id EE.log gives it, with the system it is in: `SolNode228`
+/// as `Plains of Eidolon (Earth)`.
+pub fn node_name(id: &str) -> Option<&'static str> {
+    lookup(id)
+        .filter(|entry| entry.kind == Kind::Region)
+        .map(|entry| entry.name)
+}
+
+/// A mission type by the id EE.log gives it: `MT_LANDSCAPE` as `Free Roam`.
+pub fn mission_type_name(id: &str) -> Option<&'static str> {
+    lookup(id)
+        .filter(|entry| entry.kind == Kind::MissionType)
+        .map(|entry| entry.name)
+}
+
+/// Every mission type the export names, as `(id, name)`, in the order of their names.
+pub fn mission_types() -> &'static [(&'static str, &'static str)] {
+    static TYPES: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::new();
+    TYPES.get_or_init(|| {
+        let mut types = table()
+            .iter()
+            .filter(|(_, entry)| entry.kind == Kind::MissionType)
+            .map(|(id, entry)| (*id, entry.name))
+            .collect::<Vec<_>>();
+        types.sort_by_key(|&(_, name)| name);
+        types
+    })
 }
 
 fn table() -> &'static HashMap<&'static str, Entry> {
@@ -228,6 +265,43 @@ mod tests {
             "/Lotus/Types/Friendly/Pets/CreaturePets/CreaturePetParts/Deimos/InfestedCritterMutagenD",
         ]);
         assert_eq!(item_name(vulpaphyla, &bred), Some(entry(vulpaphyla).name));
+    }
+
+    #[test]
+    fn names_the_nodes_and_mission_types_the_log_gives() {
+        assert_eq!(node_name("SolNode228"), Some("Plains of Eidolon (Earth)"));
+        assert_eq!(node_name("SolNode27"), Some("E Prime (Earth)"));
+        assert_eq!(
+            node_name("SolNode250"),
+            Some("Recall: Hunhullus (Dark Refractory, Deimos)")
+        );
+        assert_eq!(
+            node_name("CrewBattleNode501"),
+            Some("Mordo Cluster (Saturn Proxima)")
+        );
+        // Named in capitals by the dictionary, brought down to how the rest are written.
+        assert_eq!(mission_type_name("MT_LANDSCAPE"), Some("Free Roam"));
+        assert_eq!(mission_type_name("MT_CORRUPTION"), Some("Void Flood"));
+        assert_eq!(mission_type_name("MT_ALCHEMY"), Some("Alchemy"));
+        assert_eq!(
+            mission_type_name("MT_TAU_WAR"),
+            Some("The Perita Rebellion")
+        );
+        // Each only for its own kind.
+        assert_eq!(node_name("MT_LANDSCAPE"), None);
+        assert_eq!(mission_type_name("SolNode228"), None);
+        assert_eq!(node_name("EventNode12"), None, "not in the export");
+
+        let types = mission_types();
+        assert!(types.contains(&("MT_LANDSCAPE", "Free Roam")));
+        assert!(
+            types.windows(2).all(|pair| pair[0].1 <= pair[1].1),
+            "in the order of their names"
+        );
+        assert!(
+            types.iter().all(|(id, _)| id.starts_with("MT_")),
+            "mission types only"
+        );
     }
 
     #[test]

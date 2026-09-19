@@ -1,6 +1,7 @@
 pub mod geo;
 pub mod history;
 pub mod loadout;
+pub mod mission;
 pub mod monitor;
 pub mod names;
 pub mod notify;

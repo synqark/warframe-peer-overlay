@@ -2,9 +2,11 @@
 //!
 //! A member is written down the moment they drop out of the squad, which is the moment
 //! everything about them is known: what they were called, their mastery rank, the platform
-//! they played on, where they connected from, and the loadout they brought. That moment
-//! stands as the match's own time. Only those whose loadout was captured are kept — the rest
-//! would be a name and little else.
+//! they played on, where they connected from, the loadout they brought, and the mission they
+//! played with it (see `mission`). That moment stands as the match's own time. Only those who
+//! played a mission with us, and whose loadout was captured, are kept: what the history is for
+//! is the loadouts players bring to missions, and one who left before any started brought
+//! theirs to none.
 //!
 //! The newest `KEPT` of them live, newest first, in `history.json` beside the loadouts. What
 //! a card shows is kept; the loadout's whole JSON is not, since that would run to tens of
@@ -22,10 +24,10 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use windows_sys::Win32::{Foundation::SYSTEMTIME, System::SystemInformation::GetLocalTime};
 
-use crate::monitor::LoadoutView;
+use crate::{mission::Mission, monitor::LoadoutView};
 
 /// How many players are kept; the oldest fall off the end.
-const KEPT: usize = 1000;
+const KEPT: usize = 5000;
 
 /// One player, as they were when the squad they were in came apart.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -40,6 +42,14 @@ pub struct HistoryEntry {
     /// or one whose capture was never saved.
     #[serde(default)]
     pub file: String,
+    /// The mission they were last tied to (see `mission`): the node it was played at,
+    /// `SolNode228`, and its type, `MT_LANDSCAPE`, by the ids EE.log gives them (named by
+    /// `names::node_name` and `names::mission_type_name`). Both empty only for an entry
+    /// written down before missions were, when players who played none were kept as well.
+    #[serde(default)]
+    pub location: String,
+    #[serde(default)]
+    pub mission_type: String,
     /// Everything a card shows of them.
     pub view: LoadoutView,
 }
@@ -61,10 +71,10 @@ impl History {
         &self.entries
     }
 
-    /// Writes a player down as they left, along with the file their loadout was saved as.
-    /// `save` puts the lot away once the last of a squad is in, rather than once for each of
-    /// them.
-    pub fn record(&mut self, view: LoadoutView, file: String) {
+    /// Writes a player down as they left, along with the file their loadout was saved as and
+    /// the mission they were tied to. `save` puts the lot away once the last of a squad is in,
+    /// rather than once for each of them.
+    pub fn record(&mut self, view: LoadoutView, file: String, mission: &Mission) {
         let entry = HistoryEntry {
             at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -72,6 +82,8 @@ impl History {
                 .as_secs(),
             when: on_the_wall(),
             file,
+            location: mission.location.clone(),
+            mission_type: mission.mission_type.clone(),
             view,
         };
         remember(&mut self.entries, entry);
@@ -142,6 +154,8 @@ mod tests {
             at,
             when: "2026-09-13 15:32".to_owned(),
             file: format!("{at}_{name}_PC.json"),
+            location: String::new(),
+            mission_type: String::new(),
             view: LoadoutView {
                 name: name.to_owned(),
                 platform: "PC".to_owned(),
@@ -160,6 +174,39 @@ mod tests {
         assert_eq!(entries.len(), KEPT);
         assert_eq!(entries[0].at, KEPT as u64 + 9, "the newest leads");
         assert_eq!(entries[KEPT - 1].at, 10, "the oldest ten are gone");
+    }
+
+    #[test]
+    fn writes_down_the_mission_a_player_was_tied_to() {
+        let mut history = History::default();
+        let player = |name: &str| LoadoutView {
+            name: name.to_owned(),
+            ..LoadoutView::default()
+        };
+        let mission = Mission {
+            location: "SolNode6".to_owned(),
+            mission_type: "MT_EXTERMINATION".to_owned(),
+            ..Mission::default()
+        };
+        history.record(player("Tenno"), String::new(), &mission);
+
+        let entry = &history.entries()[0];
+        assert_eq!(entry.view.name, "Tenno");
+        assert_eq!(
+            (entry.location.as_str(), entry.mission_type.as_str()),
+            ("SolNode6", "MT_EXTERMINATION")
+        );
+    }
+
+    #[test]
+    fn reads_an_entry_written_down_before_missions_were() {
+        let json = r#"[{"at":10,"when":"2026-09-13 15:32","file":"10_Tenno_PC.json","view":{"name":"Tenno","platform":"PC"}}]"#;
+
+        let entries: Vec<HistoryEntry> = serde_json::from_str(json).unwrap();
+
+        assert_eq!(entries[0].view.name, "Tenno");
+        assert_eq!(entries[0].location, "");
+        assert_eq!(entries[0].mission_type, "");
     }
 
     #[test]

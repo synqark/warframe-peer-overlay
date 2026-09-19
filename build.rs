@@ -9,6 +9,11 @@
 //! school the focus export has a folder for gets a line under `FocusSchools`, named as the
 //! dictionary names that school's operator ability.
 //!
+//! Two more name what EE.log gives for the missions the history ties players to (see
+//! `src/mission.rs`), by the ids the log uses: every node of the star chart (`SolNode228`)
+//! under `Regions`, named with its system as `Plains of Eidolon (Earth)`, and every mission
+//! type (`MT_LANDSCAPE`) under `MissionTypes`, as `Free Roam`.
+//!
 //! Only the exports a loadout draws on are read. Without the submodule checked out the build
 //! still succeeds, with a warning and an empty table: items then show their internal paths.
 
@@ -44,6 +49,15 @@ const EXPORTS: [&str; 13] = [
     "FocusUpgrades",
     "Virtuals",
 ];
+
+/// A node of the star chart, in `ExportRegions`.
+#[derive(Deserialize)]
+struct Region {
+    /// Dictionary keys, for the node and the system (planet) it is in.
+    name: Option<String>,
+    #[serde(rename = "systemName")]
+    system_name: Option<String>,
+}
 
 #[derive(Deserialize)]
 struct ExportEntry {
@@ -110,6 +124,37 @@ fn main() {
             rows.push(format!("{path}\t{export}\t{part}\t{name}"));
         }
     }
+    let regions = source.join("ExportRegions.json");
+    println!("cargo::rerun-if-changed={}", regions.display());
+    let regions: HashMap<String, Region> = read(&regions);
+    for (id, region) in regions {
+        let name = |key: Option<String>| {
+            key.and_then(|key| dictionary.get(&key))
+                .map(|name| one_line(name))
+                .filter(|name| !name.is_empty())
+        };
+        let Some(node) = name(region.name) else {
+            continue;
+        };
+        let name = match name(region.system_name) {
+            Some(system) => format!("{node} ({system})"),
+            None => node,
+        };
+        rows.push(format!("{id}	Regions		{name}"));
+    }
+    let mission_types = source.join("ExportMissionTypes.json");
+    println!("cargo::rerun-if-changed={}", mission_types.display());
+    let mission_types: HashMap<String, ExportEntry> = read(&mission_types);
+    for (id, mission_type) in mission_types {
+        if let Some(name) = mission_type
+            .name
+            .and_then(|key| dictionary.get(&key))
+            .map(|name| capitalised(&one_line(name)))
+            .filter(|name| !name.is_empty())
+        {
+            rows.push(format!("{id}	MissionTypes		{name}"));
+        }
+    }
     for school in schools {
         let ability = format!("/Lotus/Language/Items/Operator{school}AbilityName");
         if let Some(name) = dictionary.get(&ability).map(|name| one_line(name)) {
@@ -129,6 +174,26 @@ fn read<T: DeserializeOwned>(file: &Path) -> T {
         fs::read(file).unwrap_or_else(|error| panic!("reading {}: {error}", file.display()));
     serde_json::from_slice(&bytes)
         .unwrap_or_else(|error| panic!("parsing {}: {error}", file.display()))
+}
+
+/// Some mission types are named in capitals (`FREE ROAM`) and some not (`Alchemy`): the
+/// capitals are brought down to how the rest are written.
+fn capitalised(name: &str) -> String {
+    if name.chars().any(char::is_lowercase) {
+        return name.to_owned();
+    }
+    name.split(' ')
+        .map(|word| {
+            let mut letters = word.chars();
+            letters.next().map_or_else(String::new, |first| {
+                first
+                    .to_uppercase()
+                    .chain(letters.flat_map(char::to_lowercase))
+                    .collect()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// A few names hold a line break, but the table keeps each on one line.

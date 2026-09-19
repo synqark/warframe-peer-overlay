@@ -89,12 +89,14 @@ fn main() -> eframe::Result {
                 LoadoutWindow::full(),
                 LoadoutWindow::grid(),
                 LoadoutWindow::history(),
+                LoadoutWindow::session(),
             ];
             let [
                 show_loadouts,
                 show_full_loadouts,
                 show_grid_loadouts,
                 show_history,
+                show_session,
             ] = loadout_windows.each_ref().map(LoadoutWindow::show_request);
             // The tray owns a thread of its own; see `tray` for why it cannot share this one.
             let egui_ctx = context.egui_ctx.clone();
@@ -106,6 +108,7 @@ fn main() -> eframe::Result {
                     tray::Command::ShowFullLoadouts => &show_full_loadouts,
                     tray::Command::ShowGridLoadouts => &show_grid_loadouts,
                     tray::Command::ShowHistory => &show_history,
+                    tray::Command::ShowSession => &show_session,
                     tray::Command::Exit => {
                         egui_ctx.send_viewport_cmd_to(
                             egui::ViewportId::ROOT,
@@ -140,7 +143,7 @@ struct OverlayApp {
     /// jobs every frame would be wasteful now that the marquee raises the repaint rate.
     cards: Vec<PeerCard>,
     /// Windows of their own, but run from this viewport's passes (see `loadout_window`).
-    loadout_windows: [LoadoutWindow; 4],
+    loadout_windows: [LoadoutWindow; 5],
     geo_enabled: bool,
     rendered_once: bool,
     native_window_configured: bool,
@@ -182,6 +185,7 @@ impl eframe::App for OverlayApp {
             for window in &mut self.loadout_windows {
                 window.set_rows(snapshot.loadouts.clone());
                 window.set_history(snapshot.history.clone());
+                window.set_session(snapshot.missions.clone(), snapshot.squad_ties.clone());
             }
             self.snapshot = Some(snapshot);
         }

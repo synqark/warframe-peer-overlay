@@ -26,6 +26,7 @@ use crate::{
     geo::{GeoInfo, GeoResolver, country_name},
     history::{History, HistoryEntry},
     loadout::{self, CaptureRequest, Captured, Job, Loadout, OwnRequest, RawJson, UpdateRequest},
+    mission::{Mission, MissionTracker},
     parser::{LogParser, Peer},
 };
 
@@ -85,6 +86,11 @@ pub struct MonitorSnapshot {
     pub loadouts: Vec<LoadoutView>,
     /// Players from squads gone by, newest first.
     pub history: Arc<[HistoryEntry]>,
+    /// The missions loaded lately, the newest last, for the session window.
+    pub missions: Vec<Mission>,
+    /// Everyone in the squad bar ourselves, by name, with the mission each is tied to: what
+    /// the history will write down with them when they leave.
+    pub squad_ties: Vec<(String, Option<Mission>)>,
 }
 
 pub fn spawn(geo_enabled: bool) -> Receiver<MonitorSnapshot> {
@@ -97,6 +103,8 @@ fn run(sender: Sender<MonitorSnapshot>, geo_enabled: bool) {
     let log_path = find_log_path();
     let mut system = System::new();
     let mut parser = LogParser::default();
+    // Apart from the parser: leaving a squad clears that, and the mission goes on regardless.
+    let mut missions = MissionTracker::default();
     let mut geo = GeoResolver::new(geo_enabled);
     let mut geo_results = HashMap::<String, GeoInfo>::new();
     let mut geo_failures = HashSet::<String>::new();
@@ -149,6 +157,7 @@ fn run(sender: Sender<MonitorSnapshot>, geo_enabled: bool) {
         let window_rect = warframe_pid.and_then(find_process_window_rect);
         if was_running && !running {
             parser.clear();
+            missions.restart();
             geo_failures.clear();
             requested_loadouts.clear();
             member_loadouts.clear();
@@ -163,7 +172,13 @@ fn run(sender: Sender<MonitorSnapshot>, geo_enabled: bool) {
         } else if !log_path.exists() {
             "EE.logが見つかりません".to_owned()
         } else {
-            match read_appended_lines(&log_path, &mut file_position, &mut pending, &mut parser) {
+            match read_appended_lines(
+                &log_path,
+                &mut file_position,
+                &mut pending,
+                &mut parser,
+                &mut missions,
+            ) {
                 Ok(()) => "EE.logを監視中".to_owned(),
                 Err(error) => format!("EE.log読み取りエラー: {error}"),
             }
@@ -293,18 +308,30 @@ fn run(sender: Sender<MonitorSnapshot>, geo_enabled: bool) {
             .cloned()
             .collect::<Vec<_>>();
         if !left.is_empty() {
-            departures += left.len() as u64;
+            let mut written = false;
             for view in left {
                 let file = saved.remove(&view.name).unwrap_or_default();
-                history.record(view, file);
+                // Only a member who played a mission with us is written down, with the mission
+                // they were last tied to, which outlives their leaving. One who left before any
+                // mission started is let go, and the loadout saved for them with them.
+                if let Some(mission) = missions.tie(&view.name).cloned() {
+                    history.record(view, file, &mission);
+                    departures += 1;
+                    written = true;
+                }
             }
-            history.save();
-            written_down = Arc::from(history.entries());
+            if written {
+                history.save();
+                written_down = Arc::from(history.entries());
+            }
             discard_what_nothing_shows(&history, &saved);
         }
         squad = members;
-        let signature =
-            format!("{running}:{status}:{peers:?}:{window_rect:?}:{loadout_cards:?}:{departures}");
+        let recent_missions = Vec::from(missions.missions().clone());
+        let squad_ties = missions.squad_ties();
+        let signature = format!(
+            "{running}:{status}:{peers:?}:{window_rect:?}:{loadout_cards:?}:{departures}:{recent_missions:?}:{squad_ties:?}"
+        );
         if signature != last_signature {
             if sender
                 .send(MonitorSnapshot {
@@ -315,6 +342,8 @@ fn run(sender: Sender<MonitorSnapshot>, geo_enabled: bool) {
                     window_rect,
                     loadouts: loadout_cards,
                     history: Arc::clone(&written_down),
+                    missions: recent_missions,
+                    squad_ties,
                 })
                 .is_err()
             {
@@ -517,12 +546,14 @@ fn read_appended_lines(
     position: &mut u64,
     pending: &mut String,
     parser: &mut LogParser,
+    missions: &mut MissionTracker,
 ) -> std::io::Result<()> {
     let length = fs::metadata(path)?.len();
     if length < *position {
         *position = 0;
         pending.clear();
         parser.clear();
+        missions.restart();
     }
     if length == *position {
         return Ok(());
@@ -542,7 +573,20 @@ fn read_appended_lines(
     let complete = pending[..complete_length].to_owned();
     pending.drain(..complete_length);
     for line in complete.lines() {
-        parser.process_line(line.trim_end_matches('\r'));
+        let line = line.trim_end_matches('\r');
+        let squad_changed = parser.process_line(line);
+        // Line by line rather than once a pass, so that the whole log replayed at start
+        // ties each member as it went, not only as it ended.
+        if missions.process_line(line) || squad_changed {
+            let local_user = parser.local_user();
+            missions.tie_squad(
+                parser
+                    .peers()
+                    .iter()
+                    .map(|peer| peer.name.as_str())
+                    .filter(|name| Some(*name) != local_user),
+            );
+        }
     }
     Ok(())
 }
@@ -567,12 +611,27 @@ mod tests {
         let mut position = 0;
         let mut pending = String::new();
         let mut parser = LogParser::default();
-        read_appended_lines(&path, &mut position, &mut pending, &mut parser).unwrap();
+        let mut missions = MissionTracker::default();
+        read_appended_lines(
+            &path,
+            &mut position,
+            &mut pending,
+            &mut parser,
+            &mut missions,
+        )
+        .unwrap();
         assert!(parser.peers().is_empty());
 
         writeln!(file).unwrap();
         file.flush().unwrap();
-        read_appended_lines(&path, &mut position, &mut pending, &mut parser).unwrap();
+        read_appended_lines(
+            &path,
+            &mut position,
+            &mut pending,
+            &mut parser,
+            &mut missions,
+        )
+        .unwrap();
         assert_eq!(parser.peers()[0].name, "A");
         fs::remove_file(path).unwrap();
     }

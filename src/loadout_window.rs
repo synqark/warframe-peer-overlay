@@ -5,8 +5,8 @@
 //! Every window shows a card per player, ours first, then each squad member in the order they
 //! joined, whose card goes as soon as they leave the squad. They differ in how a card is laid
 //! out (`Layout`): a line of gear per player (`COMPACT`), a tall card listing every slot's mods
-//! (`FULL`), six places in two rows of three (`GRID`), and everyone met before, one of them
-//! laid out as the tall card (`HISTORY`).
+//! (`FULL`), six places in two rows of three (`GRID`), and everyone met before beside what they
+//! add up to, one of them laid over that as a grid card (`HISTORY`).
 //!
 //! egui's zoom factor is global, and the overlay drives it from the game's resolution (see
 //! `ui_scale`). These windows belong to the desktop instead, so every size here goes through
@@ -14,7 +14,8 @@
 //! whatever the game's resolution.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
+    f32::consts::{FRAC_PI_2, TAU},
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -33,8 +34,13 @@ use serde::{Deserialize, Serialize};
 use warframe_peer_overlay::{
     history::HistoryEntry,
     loadout::{Item, Loadout, Operator},
+    mission::{Ending, Mission},
     monitor::LoadoutView,
     names, tray,
+};
+use windows_sys::Win32::{
+    Foundation::RECT,
+    Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromRect},
 };
 
 use crate::{flag_icon_bytes, platform_color, text_format};
@@ -61,6 +67,20 @@ struct Shown {
     history: Arc<[HistoryEntry]>,
     /// Which of those the history window has open.
     chosen: Option<HistoryEntry>,
+    /// Which of the history the statistics add up.
+    scope: Scope,
+    /// What the statistics show, with the history it was added up from and, when it is only
+    /// what the list shows, the filter that sifted it.
+    tally: Option<(Arc<[HistoryEntry]>, Option<Filter>, Tally)>,
+    /// What the history's list is narrowed to.
+    filter: Filter,
+    /// The entries the filter let through, by their place in the history, with the history
+    /// and the filter they were sifted by.
+    listed: Option<(Arc<[HistoryEntry]>, Filter, Vec<usize>)>,
+    /// The missions loaded lately, the newest last.
+    missions: Vec<Mission>,
+    /// Everyone in the squad bar ourselves, with the mission each is tied to.
+    squad_ties: Vec<(String, Option<Mission>)>,
 }
 
 /// A card per player, stacked downwards, with all their gear on one line.
@@ -92,13 +112,24 @@ const GRID: Layout = Layout {
     draw: show_grid_cards,
 };
 
-/// Everyone met before down one side, whichever of them is chosen laid out on the other.
+/// Everyone met before down one side, what they add up to on the other, and whichever of them
+/// is chosen laid over that. It opens wide enough for four columns of statistics.
 const HISTORY: Layout = Layout {
     name: "loadouts-history",
     title: "History - Warframe Peer Overlay",
-    initial_size: [820.0, 760.0],
-    min_size: [420.0, 240.0],
+    initial_size: [1600.0, 900.0],
+    min_size: [960.0, 520.0],
     draw: show_history,
+};
+
+/// A debugging aid while EE.log's missions are looked into: the one loaded last, whether it
+/// ended, and those before it.
+const SESSION: Layout = Layout {
+    name: "session",
+    title: "Session (debug) - Warframe Peer Overlay",
+    initial_size: [760.0, 460.0],
+    min_size: [420.0, 240.0],
+    draw: show_session,
 };
 
 const BACKGROUND: Color32 = Color32::from_rgb(10, 14, 20);
@@ -135,11 +166,53 @@ const MOD_INDENT: f32 = 10.0;
 /// secondary carrying twelve as often as a melee does. The slots then line up from card to
 /// card.
 const MOD_ROWS: [usize; 5] = [7, 6, 6, 6, 6];
-/// The history's list: as wide as its columns, which are as wide as they need to be.
-const LIST_WIDTH: f32 = 400.0;
+/// The history's list: as wide as its columns, which are as wide as they need to be but for
+/// the mission's node and type, whose longest names are cut short. A row's cells are set in
+/// by `ROW_MARGIN`, and the filters over them by as much.
+const LIST_WIDTH: f32 = 720.0;
+const ROW_MARGIN: [f32; 2] = [6.0, 3.0];
 const NAME_WIDTH: f32 = 150.0;
 const MASTERY_WIDTH: f32 = 52.0;
 const PLATFORM_WIDTH: f32 = 42.0;
+const NODE_WIDTH: f32 = 170.0;
+const MISSION_TYPE_WIDTH: f32 = 130.0;
+/// The history's statistics: cells in a grid `STATS_COLUMNS` wide and `STATS_ROWS` tall, each
+/// at `[column, row]`, with `STATS_GAP` between them and the list. They stand in the order of
+/// `Statistic::index`.
+const STATS_COLUMNS: usize = 4;
+const STATS_ROWS: usize = 2;
+const STATS_GAP: f32 = 8.0;
+const STATS: [(Statistic, [usize; 2]); 8] = [
+    (Statistic::Platforms, [0, 0]),
+    (Statistic::Countries, [1, 0]),
+    (Statistic::Focus, [2, 0]),
+    (Statistic::Slot(0), [3, 0]),
+    (Statistic::Slot(1), [0, 1]),
+    (Statistic::Slot(2), [1, 1]),
+    (Statistic::Slot(3), [2, 1]),
+    (Statistic::Slot(4), [3, 1]),
+];
+/// How many kinds of statistic there are.
+const KINDS: usize = STATS.len();
+/// A pie's diameter at most and at least, the room between it and its legend, and how many
+/// triangles a whole pie is made of.
+const PIE_MAX: f32 = 220.0;
+const PIE_MIN: f32 = 48.0;
+const PIE_GAP: f32 = 8.0;
+const PIE_STEPS: f32 = 120.0;
+/// A line of a legend or a ranking: the room its rank or swatch takes on the left, and that
+/// of how many and what share against the right edge.
+const RANK_WIDTH: f32 = 30.0;
+const COUNT_WIDTH: f32 = 36.0;
+const SHARE_WIDTH: f32 = 52.0;
+/// Behind a line of a ranking, the overlay's gold, faint.
+const BAR: Color32 = Color32::from_rgba_unmultiplied_const(194, 163, 87, 36);
+/// Behind a line of a legend or a ranking under the pointer.
+const HOVERED: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 14);
+/// How much of its colour a slice keeps while others are picked and it is not.
+const UNPICKED: f32 = 0.3;
+/// Laid over the statistics beneath the chosen player's card.
+const VEIL: Color32 = Color32::from_rgba_unmultiplied_const(10, 14, 20, 215);
 /// The grid's places, `GRID_COLUMNS` to a row.
 const GRID_PLACES: usize = 6;
 const GRID_COLUMNS: usize = 3;
@@ -182,6 +255,17 @@ const GEAR_SLOTS: [&str; 5] = [
 /// The quests a loadout tells about, as `(short label, full name)`.
 const QUESTS: [(&str, &str); 2] = [("New War", "The New War"), ("Old Peace", "The Old Peace")];
 
+/// What a cell of the history's statistics counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Statistic {
+    Platforms,
+    /// The country a player connected from; the region is not counted.
+    Countries,
+    Focus,
+    /// The gear in one of `GEAR_SLOTS`.
+    Slot(usize),
+}
+
 pub struct LoadoutWindow {
     layout: Layout,
     /// Raised from the tray thread, taken on the next pass.
@@ -195,10 +279,14 @@ pub struct LoadoutWindow {
     /// drag is stored once it comes to rest rather than at every step.
     seen: Option<Placement>,
     stored: Option<Placement>,
+    /// Where a window just opened is still to be put, in desktop pixels, and how many more
+    /// moves it is given to get there.
+    placing: Option<([f32; 2], u8)>,
 }
 
-/// Where a window was last left, in desktop points (the zoom divided back out), so that it
-/// opens there again on the next run.
+/// Where a window was last left, so that it opens there again on the next run: its outer
+/// corner in desktop pixels, the one measure every monitor shares, and its inner size in
+/// desktop points (the zoom divided back out) at the scale of the monitor it was on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct Placement {
     x: f32,
@@ -206,6 +294,12 @@ struct Placement {
     width: f32,
     height: f32,
 }
+
+/// How many times a window just opened is moved before it is left wherever it has got to.
+const PLACING_MOVES: u8 = 3;
+/// The strip along a window's top, in desktop pixels, that must be on a monitor for a stored
+/// placement to be used: enough of the title bar to take hold of the window by.
+const TITLE_BAR: f32 = 32.0;
 
 impl LoadoutWindow {
     /// A card per player, each player's gear on a single line.
@@ -228,6 +322,11 @@ impl LoadoutWindow {
         Self::new(HISTORY)
     }
 
+    /// The missions loaded lately, for debugging.
+    pub fn session() -> Self {
+        Self::new(SESSION)
+    }
+
     fn new(layout: Layout) -> Self {
         let stored = placements().and_then(|file| read(&file, layout.name));
         Self {
@@ -238,6 +337,7 @@ impl LoadoutWindow {
             shown: Shown::default(),
             seen: None,
             stored,
+            placing: None,
         }
     }
 
@@ -255,6 +355,15 @@ impl LoadoutWindow {
         self.shown.history = history;
     }
 
+    pub fn set_session(
+        &mut self,
+        missions: Vec<Mission>,
+        squad_ties: Vec<(String, Option<Mission>)>,
+    ) {
+        self.shown.missions = missions;
+        self.shown.squad_ties = squad_ties;
+    }
+
     /// Runs the window for one pass of the root viewport. Call it on every pass, shown or
     /// not: egui closes for good a viewport it does not hear about for a pass.
     pub fn show(&mut self, context: &egui::Context) {
@@ -262,7 +371,23 @@ impl LoadoutWindow {
         let draw = self.layout.draw;
         if self.show_request.swap(false, Ordering::Relaxed) {
             if self.builder.is_none() {
-                self.builder = Some(builder(self.layout, self.stored, Scale::of(context)));
+                // A window left where no monitor shows it now opens where Windows puts a new
+                // one, keeping only its size.
+                let at = self.stored.filter(|stored| on_screen(*stored));
+                // Pixels per point of the monitor the window is made on, which Windows picks
+                // only once it is made: the overlay's is the likeliest guess, and `place`
+                // puts right whatever it gets wrong.
+                let native = context
+                    .input(|input| input.viewport().native_pixels_per_point)
+                    .unwrap_or(1.0);
+                self.builder = Some(builder(
+                    self.layout,
+                    self.stored,
+                    at,
+                    Scale::of(context),
+                    native,
+                ));
+                self.placing = at.map(|at| ([at.x, at.y], PLACING_MOVES));
             } else {
                 // Back where the user left it, restored if minimized, and in front.
                 for command in [
@@ -294,9 +419,38 @@ impl LoadoutWindow {
                 draw(ui, &mut self.shown);
             }
         });
-        if self.visible {
+        if self.placing.is_some() {
+            self.place(context, id, Scale::of(context));
+        } else if self.visible {
             self.remember(context, id, Scale::of(context));
         }
+    }
+
+    /// Moves a window just opened to where it was left, now that it is there to say what
+    /// scale its monitor has. winit makes a position given in points into pixels at the
+    /// scale of the monitor the window is made on, not the one it is going to, so a window
+    /// left on a monitor at 100% beside a primary at 150% would open half as far out again,
+    /// and off every monitor. Crossing onto a monitor of another scale also lets Windows
+    /// suggest a corner of its own, so the window is looked at again on the next pass.
+    fn place(&mut self, context: &egui::Context, id: ViewportId, scale: Scale) {
+        let Some((target, moves)) = self.placing else {
+            return;
+        };
+        let Some((corner, native)) = context.input_for(id, |input| {
+            let viewport = input.viewport();
+            Some((viewport.outer_rect?.min, viewport.native_pixels_per_point?))
+        }) else {
+            // Not made yet.
+            return;
+        };
+        let [x, y] = scale.to_pixels([corner.x, corner.y], native);
+        if moves == 0 || ((x - target[0]).abs() < 1.0 && (y - target[1]).abs() < 1.0) {
+            self.placing = None;
+            return;
+        }
+        let [x, y] = scale.to_points(target, native);
+        context.send_viewport_cmd_to(id, ViewportCommand::OuterPosition(egui::pos2(x, y)));
+        self.placing = Some((target, moves - 1));
     }
 
     /// Writes down where the user has put the window, once they have stopped moving it, for
@@ -304,10 +458,10 @@ impl LoadoutWindow {
     fn remember(&mut self, context: &egui::Context, id: ViewportId, scale: Scale) {
         let placement = context.input_for(id, |input| {
             let viewport = input.viewport();
-            let position = viewport.outer_rect?.min;
+            let corner = viewport.outer_rect?.min;
             let size = viewport.inner_rect?.size();
             let ([x, y], [width, height]) = (
-                scale.unscaled([position.x, position.y]),
+                scale.to_pixels([corner.x, corner.y], viewport.native_pixels_per_point?),
                 scale.unscaled([size.x, size.y]),
             );
             Some(Placement {
@@ -357,7 +511,15 @@ fn write(file: &Path, name: &str, placement: Placement) {
     }
 }
 
-fn builder(layout: Layout, stored: Option<Placement>, scale: Scale) -> ViewportBuilder {
+/// Opens the window at the size it was left at, and at `at` for a monitor of `native`
+/// pixels per point.
+fn builder(
+    layout: Layout,
+    stored: Option<Placement>,
+    at: Option<Placement>,
+    scale: Scale,
+    native: f32,
+) -> ViewportBuilder {
     let (rgba, width, height) = tray::icon_rgba();
     let size = stored.map_or(layout.initial_size, |stored| [stored.width, stored.height]);
     let builder = ViewportBuilder::default()
@@ -369,12 +531,23 @@ fn builder(layout: Layout, stored: Option<Placement>, scale: Scale) -> ViewportB
             width,
             height,
         });
-    match stored {
-        // Trusted as it stands: a window left on a monitor that is now gone opens off screen,
-        // and moving it back (or deleting the file) is the way out.
-        Some(stored) => builder.with_position(scale.scaled([stored.x, stored.y])),
+    match at {
+        Some(at) => builder.with_position(scale.to_points([at.x, at.y], native)),
         None => builder,
     }
+}
+
+/// Whether a window put at `placement` would have its title bar on a monitor, for the user
+/// to take hold of it by. One left on a monitor that is gone since would open out of reach.
+fn on_screen(placement: Placement) -> bool {
+    let strip = RECT {
+        left: placement.x as i32,
+        top: placement.y as i32,
+        right: (placement.x + placement.width) as i32,
+        bottom: (placement.y + TITLE_BAR) as i32,
+    };
+    // SAFETY: reads the rectangle and nothing else.
+    !unsafe { MonitorFromRect(&strip, MONITOR_DEFAULTTONULL) }.is_null()
 }
 
 /// Turns this file's sizes, authored as desktop points, into egui points under whatever zoom
@@ -404,6 +577,18 @@ impl Scale {
     /// The other way about: what egui measured, back in desktop points, to be written down.
     fn unscaled(self, [x, y]: [f32; 2]) -> [f32; 2] {
         [x / self.0, y / self.0]
+    }
+
+    /// A position egui measured on a window of `native` pixels per point, in desktop pixels.
+    /// Points are not the same size on every monitor, so only pixels say where a window is.
+    fn to_pixels(self, position: [f32; 2], native: f32) -> [f32; 2] {
+        self.unscaled(position).map(|v| (v * native).round())
+    }
+
+    /// The position to hand egui for a window of `native` pixels per point to stand at
+    /// `pixels`.
+    fn to_points(self, [x, y]: [f32; 2], native: f32) -> [f32; 2] {
+        self.scaled([x / native, y / native])
     }
 
     fn margin(self, x: f32, y: f32) -> Margin {
@@ -759,6 +944,11 @@ fn show_grid_cards(ui: &mut egui::Ui, shown: &mut Shown) {
 /// the sample carries two auras and an operator, the most the column beside the companion
 /// holds, so no captured card stands taller.
 fn grid_fit(ui: &mut egui::Ui, size: egui::Vec2, scale: Scale) -> f32 {
+    fit(size, grid_designed(ui, scale))
+}
+
+/// How big a grid card stands at its designed size, margins and all (see `grid_fit`).
+fn grid_designed(ui: &mut egui::Ui, scale: Scale) -> egui::Vec2 {
     let sample = LoadoutView {
         name: "Tenno".to_owned(),
         platform: "PC".to_owned(),
@@ -794,11 +984,10 @@ fn grid_fit(ui: &mut egui::Ui, size: egui::Vec2, scale: Scale) -> f32 {
     sizing.set_clip_rect(egui::Rect::NOTHING);
     show_grid_card_contents(&mut sizing, &sample, scale);
     let [margin_x, margin_y] = GRID_MARGIN;
-    let designed = egui::vec2(
+    egui::vec2(
         scale.px(GRID_WIDTH + 2.0 * margin_x),
         sizing.min_rect().height() + scale.px(2.0 * margin_y),
-    );
-    fit(size, designed)
+    )
 }
 
 /// The largest step of `FIT_STEPS` at which `designed` still fits in `size`.
@@ -875,39 +1064,359 @@ fn show_vacant_place(ui: &egui::Ui, rect: egui::Rect, scale: Scale) {
     painter.galley(rect.center() - label.size() / 2.0, label, MUTED);
 }
 
-/// The history: everyone met before down the left, and whichever of them is chosen laid out
-/// on the right, exactly as the full window lays out a card.
+/// The history: everyone met before down the left, and what they add up to on the right
+/// (`show_statistics`). Choosing one of them lays their card over the statistics, as the grid
+/// lays a card out; a click anywhere but on the card, their row again or Esc puts it away, and
+/// another row puts that player's card in its place.
 fn show_history(ui: &mut egui::Ui, shown: &mut Shown) {
     let scale = Scale::of(ui.ctx());
     let history = Arc::clone(&shown.history);
+    let filter = shown.filter.clone();
+    refresh_listed(shown, &history);
+    refresh_tally(shown, &history);
     Frame::new()
         .fill(BACKGROUND)
         .inner_margin(scale.margin(10.0, 10.0))
         .show(ui, |ui| {
-            ui.set_min_size(ui.available_size());
-            ui.horizontal_top(|ui| {
-                let height = ui.available_height();
-                ui.allocate_ui_with_layout(
-                    egui::vec2(scale.px(LIST_WIDTH), height),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        ui.set_width(scale.px(LIST_WIDTH));
-                        show_history_list(ui, &history, shown, scale);
-                    },
+            let area = ui.available_rect_before_wrap();
+            let list = egui::Rect::from_min_size(
+                area.min,
+                egui::vec2(scale.px(LIST_WIDTH), area.height()),
+            );
+            let statistics = egui::Rect::from_min_max(
+                egui::pos2(list.right() + scale.px(STATS_GAP), area.top()),
+                area.max,
+            );
+            // The statistics first: what is picked there narrows the list in the same pass.
+            let room = statistics.width() > 0.0;
+            if room {
+                // A line as tall as the list's filters, to choose what the statistics add up.
+                let bar = egui::Rect::from_min_size(
+                    statistics.min,
+                    egui::vec2(statistics.width(), filter_height(ui, scale)),
                 );
-                if let Some(chosen) = shown.chosen.clone() {
-                    ScrollArea::vertical()
-                        .id_salt("chosen")
-                        .auto_shrink(false)
-                        .show(ui, |ui| show_full_card(ui, &chosen.view, scale));
+                let cells = egui::Rect::from_min_max(
+                    egui::pos2(statistics.left(), bar.bottom() + scale.px(STATS_GAP)),
+                    statistics.max,
+                );
+                show_scope(ui, bar, &mut shown.scope, scale);
+                refresh_tally(shown, &history);
+                if let Some((_, _, tally)) = &shown.tally {
+                    show_statistics(ui, cells, tally, &mut shown.filter, scale);
                 }
-            });
+            }
+            let mut left = ui.new_child(
+                UiBuilder::new()
+                    .id_salt("history-list")
+                    .max_rect(list)
+                    .layout(egui::Layout::top_down(egui::Align::LEFT)),
+            );
+            let clicked = show_history_list(&mut left, &history, shown, scale);
+            let card = shown
+                .chosen
+                .as_ref()
+                .filter(|_| room)
+                .map(|chosen| show_chosen(ui, statistics, &chosen.view, scale));
+            ui.advance_cursor_after_rect(area);
+
+            match clicked {
+                Some(entry) => {
+                    let again = shown.chosen.as_ref().is_some_and(|open| same(open, entry));
+                    shown.chosen = (!again).then(|| entry.clone());
+                }
+                None => {
+                    let away = ui.input(|input| {
+                        input.key_pressed(egui::Key::Escape)
+                            || input.pointer.primary_clicked()
+                                && input.pointer.interact_pos().is_some_and(|pointer| {
+                                    !card.is_some_and(|card: egui::Rect| card.contains(pointer))
+                                })
+                    });
+                    if away {
+                        shown.chosen = None;
+                    }
+                }
+            }
+        });
+    // The statistics were drawn before the filter changed, and while they add up only what
+    // the list shows, they are behind it until the next pass: ask for one now.
+    if shown.scope == Scope::Listed && shown.filter != filter {
+        ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+    }
+}
+
+/// Which of the history the statistics add up.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Scope {
+    /// Every entry.
+    #[default]
+    All,
+    /// Only the entries the list shows, as the filters narrow it.
+    Listed,
+}
+
+/// Sifts the history again, when it or the filter has changed since it was last.
+fn refresh_listed(shown: &mut Shown, history: &Arc<[HistoryEntry]>) {
+    if !shown
+        .listed
+        .as_ref()
+        .is_some_and(|(of, filter, _)| Arc::ptr_eq(of, history) && *filter == shown.filter)
+    {
+        let listed = shown.filter.apply(history);
+        shown.listed = Some((Arc::clone(history), shown.filter.clone(), listed));
+    }
+}
+
+/// Adds the history up again, when it, what the statistics add up, or — while that is only
+/// what the list shows — the filter has changed since it was last. A snapshot hands over the
+/// same history until there is more of it.
+fn refresh_tally(shown: &mut Shown, history: &Arc<[HistoryEntry]>) {
+    let sifted = (shown.scope == Scope::Listed).then(|| shown.filter.clone());
+    if shown
+        .tally
+        .as_ref()
+        .is_some_and(|(of, by, _)| Arc::ptr_eq(of, history) && *by == sifted)
+    {
+        return;
+    }
+    let added_up = if sifted.is_some() {
+        refresh_listed(shown, history);
+        let listed = shown
+            .listed
+            .as_ref()
+            .map_or(&[][..], |(_, _, listed)| listed.as_slice());
+        tally(listed.iter().map(|&index| &history[index]))
+    } else {
+        tally(history.iter())
+    };
+    shown.tally = Some((Arc::clone(history), sifted, added_up));
+}
+
+/// How tall a line of the list's filters stands: a box to type into, of the size they are.
+fn filter_height(ui: &egui::Ui, scale: Scale) -> f32 {
+    let line = ui.fonts_mut(|fonts| fonts.row_height(&egui::FontId::proportional(scale.px(13.0))));
+    line + scale.margin(6.0, 3.0).sum().y
+}
+
+/// The line over the statistics: against its right edge, which of the history they add up,
+/// every entry or only those the list shows.
+fn show_scope(ui: &mut egui::Ui, bar: egui::Rect, scope: &mut Scope, scale: Scale) {
+    let mut line = ui.new_child(
+        UiBuilder::new()
+            .id_salt("statistics-scope")
+            .max_rect(bar)
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+    );
+    line.spacing_mut().button_padding = egui::vec2(scale.px(8.0), scale.px(3.0));
+    line.spacing_mut().item_spacing.x = scale.px(4.0);
+    // Laid down from the right, so the last choice goes first to leave them in order.
+    line.selectable_value(
+        scope,
+        Scope::Listed,
+        single("検索データのみ", 12.0, TEXT, scale),
+    );
+    line.selectable_value(scope, Scope::All, single("全データ", 12.0, TEXT, scale));
+    line.add_space(scale.px(4.0));
+    line.label(single("統計表示対象データ：", 12.0, MUTED, scale));
+}
+
+/// The session window: the mission loaded last set out at length and whether its session
+/// ended, the mission each squad member is tied to, and every mission loaded lately, the
+/// newest at the top. Everything as the log writes it: types and locations by the game's own
+/// names, times by the log's clock.
+fn show_session(ui: &mut egui::Ui, shown: &mut Shown) {
+    let scale = Scale::of(ui.ctx());
+    Frame::new()
+        .fill(BACKGROUND)
+        .inner_margin(scale.margin(12.0, 10.0))
+        .show(ui, |ui| {
+            ui.set_min_size(ui.available_size());
+            ui.spacing_mut().item_spacing = egui::vec2(scale.px(16.0), scale.px(4.0));
+            let heading = |ui: &mut egui::Ui, text: &str| {
+                ui.label(single(text, 14.0, GOLD_TEXT, scale));
+            };
+            let note = |ui: &mut egui::Ui, text: &str| {
+                ui.label(single(text, 13.0, MUTED, scale));
+            };
+
+            heading(ui, "最後にロードしたミッション");
+            match shown.missions.last() {
+                Some(latest) => show_latest_mission(ui, latest, scale),
+                None => note(ui, "まだ SolNode のミッションのロードを見ていません。"),
+            }
+            ui.add_space(scale.px(6.0));
+            ui.separator();
+
+            heading(ui, "分隊メンバーの紐付け（抜けたときに History へ記録）");
+            if shown.squad_ties.is_empty() {
+                note(ui, "分隊にメンバーはいません。");
+            } else {
+                egui::Grid::new("session-ties")
+                    .striped(true)
+                    .spacing(egui::vec2(scale.px(20.0), scale.px(3.0)))
+                    .show(ui, |ui| {
+                        for column in ["メンバー", "location", "missionType", "ロード (秒)"]
+                        {
+                            ui.label(single(column, 12.0, MUTED, scale));
+                        }
+                        ui.end_row();
+                        for (member, tie) in &shown.squad_ties {
+                            ui.label(single(member, 13.0, TEXT, scale));
+                            match tie {
+                                Some(mission) => {
+                                    for value in [
+                                        &mission.location,
+                                        &mission.mission_type,
+                                        &mission.loaded_at,
+                                    ] {
+                                        ui.label(single(value, 13.0, TEXT, scale));
+                                    }
+                                }
+                                None => {
+                                    ui.label(single(
+                                        "なし（抜けても記録しない）",
+                                        13.0,
+                                        HOST_COLOR,
+                                        scale,
+                                    ));
+                                }
+                            }
+                            ui.end_row();
+                        }
+                    });
+            }
+            ui.add_space(scale.px(6.0));
+            ui.separator();
+
+            heading(ui, "直近のミッション（新しい順）");
+            ScrollArea::both()
+                .id_salt("session-recent")
+                .auto_shrink(false)
+                .show(ui, |ui| {
+                    egui::Grid::new("session-recent")
+                        .striped(true)
+                        .spacing(egui::vec2(scale.px(20.0), scale.px(3.0)))
+                        .show(ui, |ui| {
+                            for column in [
+                                "ロード (秒)",
+                                "役割",
+                                "location",
+                                "missionType",
+                                "ノード",
+                                "終了",
+                            ] {
+                                ui.label(single(column, 12.0, MUTED, scale));
+                            }
+                            ui.end_row();
+                            for mission in shown.missions.iter().rev() {
+                                let (ended, colour) = mission_end(mission);
+                                for (value, colour) in [
+                                    (mission.loaded_at.clone(), TEXT),
+                                    (mission_role(mission).to_owned(), TEXT),
+                                    (or_dash(&mission.location), TEXT),
+                                    (or_dash(&mission.mission_type), TEXT),
+                                    (or_dash(&mission.node), TEXT),
+                                    (ended, colour),
+                                ] {
+                                    ui.label(single(&value, 13.0, colour, scale));
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
         });
 }
 
-/// Everyone met before, newest first. Only the rows on screen are laid out: there can be a
-/// thousand of them.
-fn show_history_list(ui: &mut egui::Ui, history: &[HistoryEntry], shown: &mut Shown, scale: Scale) {
+/// The mission loaded last, a line for each of what is known of it.
+fn show_latest_mission(ui: &mut egui::Ui, latest: &Mission, scale: Scale) {
+    let (ended, ended_colour) = mission_end(latest);
+    egui::Grid::new("session-latest")
+        .spacing(egui::vec2(scale.px(24.0), scale.px(4.0)))
+        .show(ui, |ui| {
+            for (label, value, colour) in [
+                (
+                    "location",
+                    with_name(&latest.location, names::node_name(&latest.location)),
+                    TEXT,
+                ),
+                (
+                    "missionType",
+                    with_name(
+                        &latest.mission_type,
+                        names::mission_type_name(&latest.mission_type),
+                    ),
+                    TEXT,
+                ),
+                ("ノード", or_dash(&latest.node), TEXT),
+                (
+                    "ロード",
+                    format!("{} 秒 ({})", latest.loaded_at, mission_role(latest)),
+                    TEXT,
+                ),
+                ("セッション終了", ended, ended_colour),
+            ] {
+                ui.label(single(label, 12.0, MUTED, scale));
+                ui.label(single(&value, 16.0, colour, scale));
+                ui.end_row();
+            }
+        });
+}
+
+/// Whether we loaded the mission as its host or joined it.
+fn mission_role(mission: &Mission) -> &'static str {
+    if mission.host {
+        "ホスト"
+    } else {
+        "クライアント"
+    }
+}
+
+/// Whether the mission's session ended, and in what colour to say so: done, by the `EOM` or
+/// the abort the log showed and when, or not yet.
+fn mission_end(mission: &Mission) -> (String, Color32) {
+    match &mission.ended {
+        Some(ended) => {
+            let by = match ended.by {
+                Ending::Eom => "EOM",
+                Ending::Abort => "Abort",
+            };
+            (format!("済 ({by} {} 秒)", ended.at), QUEST_DONE)
+        }
+        None => ("未".to_owned(), HOST_COLOR),
+    }
+}
+
+/// An id as the log gives it, followed by the name the export gives it where it does.
+fn with_name(id: &str, name: Option<&str>) -> String {
+    match name {
+        Some(name) => format!("{id} → {name}"),
+        None => or_dash(id),
+    }
+}
+
+/// The text as it is, or `—` for none.
+fn or_dash(text: &str) -> String {
+    if text.is_empty() {
+        "—".to_owned()
+    } else {
+        text.to_owned()
+    }
+}
+
+/// Whether two entries of the history are the same player's departure.
+fn same(one: &HistoryEntry, other: &HistoryEntry) -> bool {
+    one.at == other.at && one.view.name == other.view.name
+}
+
+/// Everyone met before whom the filter lets through, newest first, under the box to search
+/// them by name; and whichever of them was clicked. Only the rows on screen are laid out:
+/// there can be thousands of them.
+fn show_history_list<'a>(
+    ui: &mut egui::Ui,
+    history: &'a Arc<[HistoryEntry]>,
+    shown: &mut Shown,
+    scale: Scale,
+) -> Option<&'a HistoryEntry> {
     if history.is_empty() {
         ui.label(single(
             "まだ記録がありません。分隊のメンバーが抜けたときに記録します。",
@@ -915,32 +1424,749 @@ fn show_history_list(ui: &mut egui::Ui, history: &[HistoryEntry], shown: &mut Sh
             MUTED,
             scale,
         ));
-        return;
+        return None;
+    }
+    show_list_header(ui, &mut shown.filter, scale);
+    refresh_listed(shown, history);
+    let listed = shown
+        .listed
+        .as_ref()
+        .map_or(&[][..], |(_, _, listed)| listed.as_slice());
+    let count = if shown.filter.is_empty() {
+        format!("{}件", history.len())
+    } else {
+        format!("{} / {}件", listed.len(), history.len())
+    };
+    ui.label(single(&count, 12.0, MUTED, scale));
+    if listed.is_empty() {
+        ui.label(single("条件に合う記録がありません。", 13.0, MUTED, scale));
+        return None;
     }
     let row = ui.fonts_mut(|fonts| fonts.layout_job(single("M", 14.0, TEXT, scale)).size().y)
         + scale.px(6.0);
+    let chosen = shown.chosen.as_ref();
+    let mut clicked = None;
     ScrollArea::vertical()
         .id_salt("history")
         .auto_shrink(false)
-        .show_rows(ui, row, history.len(), |ui, range| {
-            for entry in &history[range] {
-                if show_history_row(ui, entry, shown.chosen.as_ref(), scale) {
-                    shown.chosen = Some(entry.clone());
+        .show_rows(ui, row, listed.len(), |ui, range| {
+            for &index in &listed[range] {
+                let entry = &history[index];
+                if show_history_row(ui, entry, chosen, scale) {
+                    clicked = Some(entry);
+                }
+            }
+        });
+    clicked
+}
+
+/// The list's header: over each column with a filter, that filter, lined up with the column's
+/// cells - a box to search by name over the columns that say who a player was, one to search
+/// by the mission's node over its column, and a menu of the mission types over theirs - and,
+/// against the right edge, a button that lets every filter go, the picks in the statistics
+/// included.
+fn show_list_header(ui: &mut egui::Ui, filter: &mut Filter, scale: Scale) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().button_padding = egui::vec2(scale.px(8.0), scale.px(3.0));
+        let gap = ui.spacing().item_spacing.x;
+        // In from the edge as far as a row's margin sets its cells.
+        ui.add_space(f32::from(scale.margin(ROW_MARGIN[0], ROW_MARGIN[1]).left));
+        let who = scale.px(NAME_WIDTH + MASTERY_WIDTH + PLATFORM_WIDTH) + 2.0 * gap;
+        search_box(
+            ui,
+            &mut filter.name,
+            "history-name",
+            "名前で検索",
+            who,
+            scale,
+        );
+        let node = scale.px(NODE_WIDTH);
+        search_box(
+            ui,
+            &mut filter.node,
+            "history-node",
+            "ノードで検索",
+            node,
+            scale,
+        );
+        mission_type_menu(ui, &mut filter.mission_type, scale);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let clear = egui::Button::new(single("絞り込み解除", 12.0, TEXT, scale));
+            if ui.add_enabled(!filter.is_empty(), clear).clicked() {
+                *filter = Filter::default();
+            }
+        });
+    });
+    ui.add_space(scale.px(2.0));
+}
+
+/// A box to type a search into, `width` wide.
+fn search_box(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    id: &str,
+    hint: &str,
+    width: f32,
+    scale: Scale,
+) {
+    ui.add(
+        egui::TextEdit::singleline(text)
+            .id_salt(id)
+            .hint_text(single(hint, 13.0, MUTED, scale))
+            .font(egui::FontId::proportional(scale.px(13.0)))
+            .margin(scale.margin(6.0, 3.0))
+            .desired_width(width),
+    );
+}
+
+/// The menu of every mission type the export names, in the order of their names, over the
+/// column of mission types and as wide as it; its list grows as wide as the longest name.
+fn mission_type_menu(ui: &mut egui::Ui, picked: &mut Option<String>, scale: Scale) {
+    let width = scale.px(MISSION_TYPE_WIDTH);
+    let selected = match picked.as_deref() {
+        Some(id) => single(
+            names::mission_type_name(id).unwrap_or(id),
+            13.0,
+            TEXT,
+            scale,
+        ),
+        None => single("タイプ", 13.0, MUTED, scale),
+    };
+    // Held to the column's width, which a long name is cut short to rather than widen it.
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, ui.available_height()),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_max_width(width);
+            egui::ComboBox::from_id_salt("history-mission-type")
+                .width(width)
+                .height(scale.px(480.0))
+                .wrap_mode(egui::TextWrapMode::Truncate)
+                .selected_text(selected)
+                .show_ui(ui, |ui| {
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                    ui.selectable_value(picked, None, single("すべて", 13.0, MUTED, scale));
+                    for (id, name) in names::mission_types() {
+                        let option = single(name, 13.0, TEXT, scale);
+                        ui.selectable_value(picked, Some((*id).to_owned()), option);
+                    }
+                });
+        },
+    );
+}
+
+/// The chosen player's card, laid over the statistics on a veil that dims them, drawn as a
+/// grid card at the largest step that fits and no larger than it is designed at. Being in an
+/// area of its own, above the window's contents, it keeps the pointer from what it covers.
+/// Returns where the card is.
+fn show_chosen(ui: &mut egui::Ui, over: egui::Rect, row: &LoadoutView, scale: Scale) -> egui::Rect {
+    let designed = grid_designed(ui, scale);
+    let room = over.shrink(scale.px(STATS_GAP)).size();
+    let fitted = fit(room, designed).min(1.0);
+    let card = egui::Rect::from_center_size(over.center(), designed * fitted);
+    let context = ui.ctx().clone();
+    egui::Area::new(ui.id().with("chosen"))
+        .order(egui::Order::Middle)
+        .fixed_pos(over.min)
+        .constrain(false)
+        .fade_in(false)
+        .show(&context, |ui| {
+            ui.painter()
+                .rect_filled(over, CornerRadius::same(scale.px(6.0).round() as u8), VEIL);
+            ui.set_min_size(over.size());
+            let mut inside = ui.new_child(
+                UiBuilder::new()
+                    .id_salt("chosen-card")
+                    .max_rect(card)
+                    .layout(egui::Layout::top_down(egui::Align::LEFT)),
+            );
+            inside.set_clip_rect(card);
+            show_grid_card(&mut inside, row, card, scale.times(fitted));
+        });
+    card
+}
+
+/// What the history adds up to, in a grid of cells (`STATS`): platforms and focus schools as
+/// pies, countries and each slot's gear as rankings, most first. It always adds up the whole
+/// history, whatever the list is narrowed to. Every slice and line is a toggle: anything picked
+/// in a cell narrows the list to the players who match one of the picks (`Filter`).
+fn show_statistics(
+    ui: &mut egui::Ui,
+    area: egui::Rect,
+    tally: &Tally,
+    filter: &mut Filter,
+    scale: Scale,
+) {
+    let gap = scale.px(STATS_GAP);
+    let cell = egui::vec2(
+        (area.width() - gap * (STATS_COLUMNS - 1) as f32) / STATS_COLUMNS as f32,
+        (area.height() - gap * (STATS_ROWS - 1) as f32) / STATS_ROWS as f32,
+    )
+    .max(egui::Vec2::ZERO);
+    for (statistic, [column, row]) in STATS {
+        let rect = egui::Rect::from_min_size(
+            area.min + egui::vec2(column as f32 * (cell.x + gap), row as f32 * (cell.y + gap)),
+            cell,
+        );
+        let mut inside = ui.new_child(
+            UiBuilder::new()
+                .id_salt(("statistic", column, row))
+                .max_rect(rect)
+                .layout(egui::Layout::top_down(egui::Align::LEFT)),
+        );
+        inside.set_clip_rect(rect.intersect(ui.clip_rect()));
+        let counted = &tally.kinds[statistic.index()];
+        let picked = &mut filter.picked[statistic.index()];
+        Frame::new()
+            .fill(CARD_FILL)
+            .corner_radius(CornerRadius::same(scale.px(6.0).round() as u8))
+            .inner_margin(scale.margin(10.0, 8.0))
+            .show(&mut inside, |ui| {
+                ui.set_min_size(ui.available_size());
+                ui.spacing_mut().item_spacing = egui::vec2(scale.px(8.0), scale.px(2.0));
+                match statistic {
+                    Statistic::Platforms | Statistic::Focus => {
+                        show_pie(ui, statistic, counted, picked, scale);
+                    }
+                    Statistic::Countries => {
+                        show_ranking(ui, statistic, counted, counted.players, picked, scale);
+                    }
+                    Statistic::Slot(_) => {
+                        show_ranking(ui, statistic, counted, tally.loadouts, picked, scale);
+                    }
+                }
+            });
+    }
+}
+
+/// A cell's title, with a note on how much it counts against the right edge.
+fn show_cell_title(ui: &mut egui::Ui, title: &str, note: &str, scale: Scale) {
+    ui.horizontal(|ui| {
+        whole(ui, single(title, 14.0, GOLD_TEXT, scale));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            whole(ui, single(note, 12.0, MUTED, scale));
+        });
+    });
+    ui.add_space(scale.px(4.0));
+}
+
+/// A pie as large as the cell leaves room for above its legend, which scrolls when even the
+/// smallest pie leaves it too little. Hovering a slice says what it is. A click on a slice, or
+/// on its line in the legend, picks it; while anything is picked, the rest are dimmed.
+fn show_pie(
+    ui: &mut egui::Ui,
+    statistic: Statistic,
+    counted: &Counted,
+    picked: &mut BTreeSet<String>,
+    scale: Scale,
+) {
+    show_cell_title(
+        ui,
+        statistic.title(),
+        &format!("{}人", counted.players),
+        scale,
+    );
+    let shares = &counted.shares;
+    if counted.players == 0 {
+        ui.label(single("記録なし", 13.0, MUTED, scale));
+        return;
+    }
+    let colours = shares
+        .iter()
+        .map(|share| {
+            let colour = slice_color(statistic, &share.key);
+            if picked.is_empty() || picked.contains(&share.key) {
+                colour
+            } else {
+                colour.gamma_multiply(UNPICKED)
+            }
+        })
+        .collect::<Vec<_>>();
+    let height = share_line_height(ui, scale);
+    let legend = shares.len() as f32 * (height + ui.spacing().item_spacing.y);
+    let diameter = (ui.available_height() - legend - scale.px(PIE_GAP))
+        .min(ui.available_width())
+        .min(scale.px(PIE_MAX))
+        .max(scale.px(PIE_MIN));
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), diameter), Sense::click());
+    let (center, radius) = (rect.center(), diameter / 2.0);
+    paint_pie(ui.painter(), center, radius, shares, &colours, scale);
+    let hovered = response
+        .hover_pos()
+        .and_then(|pointer| slice_at(shares, pointer - center, radius));
+    if let Some(index) = hovered {
+        let share = &shares[index];
+        let response = response
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text_at_pointer(format!(
+                "{}\n{}人 ({})",
+                share.label,
+                share.count,
+                percent(share.count, counted.players)
+            ));
+        if response.clicked() {
+            toggle(picked, &share.key);
+        }
+    }
+    ui.add_space(scale.px(PIE_GAP));
+    ScrollArea::vertical()
+        .id_salt("legend")
+        .auto_shrink(false)
+        .show(ui, |ui| {
+            for (share, colour) in shares.iter().zip(colours) {
+                let line = Line {
+                    share,
+                    out_of: counted.players,
+                    lead: Lead::Swatch(colour),
+                    flag: false,
+                    bar: None,
+                    picked: picked.contains(&share.key),
+                };
+                if show_share_line(ui, line, height, scale) {
+                    toggle(picked, &share.key);
                 }
             }
         });
 }
 
-/// One player of the history: who they were, and when the squad came apart. Says whether it
-/// has just been asked for.
+/// The slices as a mesh of triangles fanned out from the centre, clockwise from the top, each
+/// in its colour of `colours`. A mesh is not smoothed at its edges, so lines in the cell's
+/// colour part the slices and trim the rim.
+fn paint_pie(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    shares: &[Share],
+    colours: &[Color32],
+    scale: Scale,
+) {
+    let total: usize = shares.iter().map(|share| share.count).sum();
+    let point = |angle: f32| center + radius * egui::vec2(angle.cos(), angle.sin());
+    let mut mesh = egui::Mesh::default();
+    let mut edges = Vec::with_capacity(shares.len());
+    let mut from = -FRAC_PI_2;
+    for (share, colour) in shares.iter().zip(colours) {
+        let sweep = TAU * share.count as f32 / total as f32;
+        let steps = ((sweep / TAU * PIE_STEPS).ceil() as u32).max(1);
+        let base = mesh.vertices.len() as u32;
+        mesh.colored_vertex(center, *colour);
+        for step in 0..=steps {
+            mesh.colored_vertex(point(from + sweep * step as f32 / steps as f32), *colour);
+        }
+        for step in 0..steps {
+            mesh.add_triangle(base, base + 1 + step, base + 2 + step);
+        }
+        edges.push(from);
+        from += sweep;
+    }
+    painter.add(egui::Shape::mesh(mesh));
+    let stroke = Stroke::new(scale.px(1.5), CARD_FILL);
+    if shares.len() > 1 {
+        for angle in edges {
+            painter.line_segment([center, point(angle)], stroke);
+        }
+    }
+    painter.circle_stroke(center, radius, stroke);
+}
+
+/// Which of the slices lies `offset` from the pie's centre, if any.
+fn slice_at(shares: &[Share], offset: egui::Vec2, radius: f32) -> Option<usize> {
+    let total: usize = shares.iter().map(|share| share.count).sum();
+    if total == 0 || offset.length() > radius {
+        return None;
+    }
+    // Round from the top, clockwise, as the slices are laid.
+    let turned = (offset.y.atan2(offset.x) + FRAC_PI_2).rem_euclid(TAU) / TAU;
+    let mut until = 0;
+    shares.iter().position(|share| {
+        until += share.count;
+        turned < until as f32 / total as f32
+    })
+}
+
+/// A ranking, most first, each line with its rank (and a country's flag), how many players it
+/// counts and what share of `out_of` that is, over a bar as long as its share of the first's. A
+/// click on a line picks it. Only the lines on screen are laid out.
+fn show_ranking(
+    ui: &mut egui::Ui,
+    statistic: Statistic,
+    counted: &Counted,
+    out_of: usize,
+    picked: &mut BTreeSet<String>,
+    scale: Scale,
+) {
+    let shares = &counted.shares;
+    let note = match statistic {
+        Statistic::Countries => format!("{}か国", shares.len()),
+        _ => format!("{}種", shares.len()),
+    };
+    show_cell_title(ui, statistic.title(), &note, scale);
+    let Some(first) = shares.first() else {
+        ui.label(single("記録なし", 13.0, MUTED, scale));
+        return;
+    };
+    let most = first.count as f32;
+    let height = share_line_height(ui, scale);
+    ScrollArea::vertical()
+        .id_salt("ranking")
+        .auto_shrink(false)
+        .show_rows(ui, height, shares.len(), |ui, range| {
+            for share in &shares[range] {
+                let line = Line {
+                    share,
+                    out_of,
+                    // Those counted as often share a rank.
+                    lead: Lead::Rank(shares.partition_point(|other| other.count > share.count) + 1),
+                    flag: statistic == Statistic::Countries,
+                    bar: Some(share.count as f32 / most),
+                    picked: picked.contains(&share.key),
+                };
+                if show_share_line(ui, line, height, scale) {
+                    toggle(picked, &share.key);
+                }
+            }
+        });
+}
+
+/// How tall a line of a legend or a ranking stands.
+fn share_line_height(ui: &egui::Ui, scale: Scale) -> f32 {
+    ui.fonts_mut(|fonts| fonts.layout_job(single("M", 13.0, TEXT, scale)).size().y) + scale.px(6.0)
+}
+
+/// What a line of a legend or a ranking opens with.
+enum Lead {
+    Swatch(Color32),
+    Rank(usize),
+}
+
+/// One line of a legend or a ranking.
+struct Line<'a> {
+    share: &'a Share,
+    /// What its share is a share of.
+    out_of: usize,
+    lead: Lead,
+    /// Whether a flag stands before the label, the share's key then being a country's code.
+    flag: bool,
+    /// How far a bar behind the line runs, as a share of the line's length.
+    bar: Option<f32>,
+    /// Whether it is picked to narrow the list by.
+    picked: bool,
+}
+
+/// One line of a legend or a ranking: its lead, the label, then how many and what share
+/// against the right edge. A label too long for its room is cut short, the whole of it then a
+/// hover away, and a picked line is outlined in gold. Says whether it was clicked.
+fn show_share_line(ui: &mut egui::Ui, line: Line, height: f32, scale: Scale) -> bool {
+    let Line {
+        share,
+        out_of,
+        lead,
+        flag,
+        bar,
+        picked,
+    } = line;
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::click());
+    let layout = |job: LayoutJob| ui.fonts_mut(|fonts| fonts.layout_job(job));
+    let lead_width = scale.px(RANK_WIDTH);
+    // Every line of a ranking of countries keeps room for a flag, one the icons lack included,
+    // so the names line up.
+    let flag_width = if flag { scale.px(FLAG_SIZE + 6.0) } else { 0.0 };
+    let share_right = rect.right() - scale.px(4.0);
+    let count_right = share_right - scale.px(SHARE_WIDTH);
+    let label_left = rect.left() + lead_width + flag_width;
+    let colour = if picked { GOLD_TEXT } else { TEXT };
+    let proportion = layout(single(&percent(share.count, out_of), 12.0, MUTED, scale));
+    let count = layout(single(&share.count.to_string(), 13.0, colour, scale));
+    let mut job = single(&share.label, 13.0, colour, scale);
+    job.wrap = TextWrapping::truncate_at_width(
+        (count_right - scale.px(COUNT_WIDTH) - label_left).max(0.0),
+    );
+    let label = layout(job);
+    let elided = label.elided;
+    let rank = match lead {
+        Lead::Rank(rank) => Some(layout(single(&rank.to_string(), 12.0, MUTED, scale))),
+        Lead::Swatch(_) => None,
+    };
+
+    let painter = ui.painter();
+    let middle =
+        |size: egui::Vec2, right: f32| egui::pos2(right - size.x, rect.center().y - size.y / 2.0);
+    let corner = CornerRadius::same(scale.px(3.0).round() as u8);
+    if let Some(bar) = bar {
+        painter.rect_filled(
+            egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * bar, rect.height())),
+            corner,
+            BAR,
+        );
+    }
+    if picked {
+        painter.rect_stroke(
+            rect,
+            corner,
+            Stroke::new(scale.px(1.0), OWN_STROKE),
+            StrokeKind::Inside,
+        );
+    } else if response.hovered() {
+        painter.rect_filled(rect, corner, HOVERED);
+    }
+    match (lead, rank) {
+        (Lead::Swatch(colour), _) => {
+            let swatch = egui::Rect::from_center_size(
+                egui::pos2(rect.left() + lead_width / 2.0, rect.center().y),
+                egui::Vec2::splat(scale.px(10.0)),
+            );
+            painter.rect_filled(
+                swatch,
+                CornerRadius::same(scale.px(2.0).round() as u8),
+                colour,
+            );
+        }
+        (Lead::Rank(_), Some(rank)) => {
+            let at = middle(rank.size(), rect.left() + lead_width - scale.px(8.0));
+            painter.galley(at, rank, MUTED);
+        }
+        (Lead::Rank(_), None) => {}
+    }
+    if flag && let Some((uri, bytes)) = flag_icon_bytes(&share.key) {
+        let at = egui::Rect::from_min_size(
+            egui::pos2(
+                rect.left() + lead_width,
+                rect.center().y - scale.px(FLAG_SIZE) / 2.0,
+            ),
+            egui::Vec2::splat(scale.px(FLAG_SIZE)),
+        );
+        egui::Image::from_bytes(uri, bytes).paint_at(ui, at);
+    }
+    painter.galley(
+        middle(label.size(), label_left + label.size().x),
+        label,
+        colour,
+    );
+    painter.galley(middle(count.size(), count_right), count, colour);
+    painter.galley(middle(proportion.size(), share_right), proportion, MUTED);
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let clicked = response.clicked();
+    if elided {
+        response.on_hover_text(&share.label);
+    }
+    clicked
+}
+
+/// `count` as a share of `out_of`, to a tenth of a percent.
+fn percent(count: usize, out_of: usize) -> String {
+    format!("{:.1}%", count as f64 * 100.0 / out_of.max(1) as f64)
+}
+
+/// What the history adds up to, for the statistics beside its list. Everyone it keeps is
+/// counted as often as they were met.
+#[derive(Debug, Default)]
+struct Tally {
+    /// Players whose loadout the history keeps: what the gear's shares are out of.
+    loadouts: usize,
+    /// Each kind of statistic, added up, in the order of `STATS` (`Statistic::index`).
+    kinds: [Counted; KINDS],
+}
+
+/// One kind of statistic, added up.
+#[derive(Debug, Default)]
+struct Counted {
+    /// The players it knows something of: every one for the platforms, those whose country
+    /// is known for the countries, and so on.
+    players: usize,
+    /// Most first, and those counted as often in the order of their labels.
+    shares: Vec<Share>,
+}
+
+/// How many players something was counted for.
+#[derive(Debug, PartialEq, Eq)]
+struct Share {
+    /// What a player is matched on (`Statistic::key`).
+    key: String,
+    label: String,
+    count: usize,
+}
+
+fn tally<'a>(entries: impl IntoIterator<Item = &'a HistoryEntry>) -> Tally {
+    // Each key's count, and the first player counted under it, for its label.
+    let mut counts: [HashMap<&str, (usize, &HistoryEntry)>; KINDS] = Default::default();
+    let mut loadouts = 0;
+    for entry in entries {
+        loadouts += usize::from(entry.view.loadout.is_some());
+        for (statistic, _) in STATS {
+            if let Some(key) = statistic.key(entry) {
+                counts[statistic.index()].entry(key).or_insert((0, entry)).0 += 1;
+            }
+        }
+    }
+    let kinds = std::array::from_fn(|index| {
+        let (statistic, _) = STATS[index];
+        let mut shares = std::mem::take(&mut counts[index])
+            .into_iter()
+            .map(|(key, (count, entry))| Share {
+                key: key.to_owned(),
+                label: statistic.label(key, entry),
+                count,
+            })
+            .collect::<Vec<_>>();
+        shares.sort_by(most_first);
+        Counted {
+            players: shares.iter().map(|share| share.count).sum(),
+            shares,
+        }
+    });
+    Tally { loadouts, kinds }
+}
+
+/// Most counted first, and those counted as often in the order of their labels.
+fn most_first(one: &Share, other: &Share) -> std::cmp::Ordering {
+    other
+        .count
+        .cmp(&one.count)
+        .then_with(|| one.label.cmp(&other.label))
+}
+
+impl Statistic {
+    /// Where it stands in `STATS`, and so in `Tally::kinds` and `Filter::picked`.
+    fn index(self) -> usize {
+        match self {
+            Statistic::Platforms => 0,
+            Statistic::Countries => 1,
+            Statistic::Focus => 2,
+            Statistic::Slot(slot) => 3 + slot,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Statistic::Platforms => "プラットフォーム",
+            Statistic::Countries => "国",
+            Statistic::Focus => "フォーカス",
+            Statistic::Slot(slot) => GEAR_SLOTS[slot],
+        }
+    }
+
+    /// What a player is counted under, if anything: their platform; their country's code, or
+    /// its name where the code is unknown; the path of their focus school; or the name the
+    /// arsenal gives what fills the slot.
+    fn key(self, entry: &HistoryEntry) -> Option<&str> {
+        let view = &entry.view;
+        match self {
+            Statistic::Platforms => Some(view.platform.as_str()).filter(|key| !key.is_empty()),
+            Statistic::Countries => [&view.country_code, &view.country]
+                .into_iter()
+                .map(String::as_str)
+                .find(|key| !key.is_empty()),
+            Statistic::Focus => view.loadout.as_ref()?.operator.as_ref()?.focus.as_deref(),
+            Statistic::Slot(slot) => items(view.loadout.as_ref()?)[slot].as_ref().map(item_label),
+        }
+    }
+
+    /// What a key is shown as, `entry` being a player counted under it: a country by its name
+    /// and a focus school by the table's, anything else as it is.
+    fn label(self, key: &str, entry: &HistoryEntry) -> String {
+        match self {
+            Statistic::Countries if !entry.view.country.is_empty() => entry.view.country.clone(),
+            Statistic::Focus => dictionary_name(key).to_owned(),
+            _ => key.to_owned(),
+        }
+    }
+}
+
+/// A slice's colour: a platform in the colour the overlay writes it in, a focus school in one
+/// of its own.
+fn slice_color(statistic: Statistic, key: &str) -> Color32 {
+    match statistic {
+        Statistic::Platforms => platform_color(key),
+        Statistic::Focus => focus_color(key),
+        _ => MUTED,
+    }
+}
+
+/// Each focus school in a colour of its own, the school told by the folder its path runs
+/// through.
+fn focus_color(path: &str) -> Color32 {
+    match path.rsplit('/').nth(1) {
+        Some("Attack") => Color32::from_rgb(232, 104, 72), // Madurai
+        Some("Defense") => Color32::from_rgb(76, 190, 200), // Vazarin
+        Some("Power") => Color32::from_rgb(132, 128, 240), // Zenurik
+        Some("Tactic") => Color32::from_rgb(232, 196, 84), // Naramon
+        Some("Ward") => Color32::from_rgb(176, 140, 100),  // Unairu
+        _ => MUTED,
+    }
+}
+
+/// What the history's list is narrowed to: the players whose name holds what is typed over
+/// its column, and whose mission's node holds what is typed over that one - by the node's name
+/// or its id, `SolNode228`, either way ignoring case - whose mission was of the type picked
+/// over its column, and who, in every kind of statistic with anything picked, match one of the
+/// picks. With nothing typed or picked, everyone.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Filter {
+    name: String,
+    node: String,
+    /// By id, `MT_LANDSCAPE`.
+    mission_type: Option<String>,
+    /// The keys picked in each kind of statistic (`Statistic::index`).
+    picked: [BTreeSet<String>; KINDS],
+}
+
+impl Filter {
+    fn is_empty(&self) -> bool {
+        self.name.trim().is_empty()
+            && self.node.trim().is_empty()
+            && self.mission_type.is_none()
+            && self.picked.iter().all(BTreeSet::is_empty)
+    }
+
+    /// The entries of the history it lets through, by their place in it.
+    fn apply(&self, history: &[HistoryEntry]) -> Vec<usize> {
+        let needle = |typed: &str| typed.trim().to_lowercase();
+        let (name, node) = (needle(&self.name), needle(&self.node));
+        let holds = |text: &str, needle: &str| text.to_lowercase().contains(needle);
+        history
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                (name.is_empty() || holds(&entry.view.name, &name))
+                    && (node.is_empty()
+                        || !entry.location.is_empty()
+                            && (holds(&entry.location, &node)
+                                || names::node_name(&entry.location)
+                                    .is_some_and(|named| holds(named, &node))))
+                    && self
+                        .mission_type
+                        .as_ref()
+                        .is_none_or(|picked| entry.mission_type == *picked)
+                    && STATS.iter().all(|(statistic, _)| {
+                        let picked = &self.picked[statistic.index()];
+                        picked.is_empty()
+                            || statistic.key(entry).is_some_and(|key| picked.contains(key))
+                    })
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+}
+
+/// Picks `key`, or lets it go if it was picked.
+fn toggle(picked: &mut BTreeSet<String>, key: &str) {
+    if !picked.remove(key) {
+        picked.insert(key.to_owned());
+    }
+}
+
+/// One player of the history: who they were, the mission they were tied to, and when the squad
+/// came apart. Says whether it has just been asked for.
 fn show_history_row(
     ui: &mut egui::Ui,
     entry: &HistoryEntry,
     chosen: Option<&HistoryEntry>,
     scale: Scale,
 ) -> bool {
-    let open =
-        chosen.is_some_and(|chosen| chosen.at == entry.at && chosen.view.name == entry.view.name);
+    let open = chosen.is_some_and(|chosen| same(chosen, entry));
+    let mut cut_short = false;
     let row = Frame::new()
         .fill(if open {
             CARD_FILL
@@ -948,7 +2174,7 @@ fn show_history_row(
             Color32::TRANSPARENT
         })
         .corner_radius(CornerRadius::same(scale.px(4.0).round() as u8))
-        .inner_margin(scale.margin(6.0, 3.0))
+        .inner_margin(scale.margin(ROW_MARGIN[0], ROW_MARGIN[1]))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -962,6 +2188,18 @@ fn show_history_row(
                     ui,
                     platform_job(&entry.view, scale),
                     scale.px(PLATFORM_WIDTH),
+                );
+                let [node, mission_type] = mission_labels(entry);
+                let colour = if entry.location.is_empty() {
+                    MUTED
+                } else {
+                    LOCATION
+                };
+                cut_short |= column(ui, single(&node, 13.0, colour, scale), scale.px(NODE_WIDTH));
+                cut_short |= column(
+                    ui,
+                    single(&mission_type, 13.0, colour, scale),
+                    scale.px(MISSION_TYPE_WIDTH),
                 );
                 match flag_icon_bytes(&entry.view.country_code) {
                     Some((uri, bytes)) => {
@@ -977,21 +2215,56 @@ fn show_history_row(
                 });
             });
         });
-    ui.interact(
-        row.response.rect,
-        ui.id().with((entry.at, entry.view.name.as_str())),
-        Sense::click(),
-    )
-    .on_hover_cursor(egui::CursorIcon::PointingHand)
-    .clicked()
+    let response = ui
+        .interact(
+            row.response.rect,
+            ui.id().with((entry.at, entry.view.name.as_str())),
+            Sense::click(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let clicked = response.clicked();
+    // The mission's names in full, and the ids the log gave, where a column cut them short.
+    if cut_short {
+        let [node, mission_type] = mission_labels(entry);
+        response.on_hover_text(format!(
+            "{node}
+{mission_type}
+{} / {}",
+            entry.location, entry.mission_type
+        ));
+    }
+    clicked
 }
 
-/// A cell of the history's list, cut short where it does not fit its column.
-fn column(ui: &mut egui::Ui, mut job: LayoutJob, width: f32) {
+/// The node and the type of the mission a player of the history was tied to, as the list
+/// names them: as the export does, by the id EE.log gave where the export lacks it, and `—`
+/// where they were tied to none.
+fn mission_labels(entry: &HistoryEntry) -> [String; 2] {
+    let label = |id: &str, name: Option<&str>| {
+        if id.is_empty() {
+            "—".to_owned()
+        } else {
+            name.unwrap_or(id).to_owned()
+        }
+    };
+    [
+        label(&entry.location, names::node_name(&entry.location)),
+        label(
+            &entry.mission_type,
+            names::mission_type_name(&entry.mission_type),
+        ),
+    ]
+}
+
+/// A cell of the history's list, cut short where it does not fit its column. Says whether it
+/// was.
+fn column(ui: &mut egui::Ui, mut job: LayoutJob, width: f32) -> bool {
     job.wrap = TextWrapping::truncate_at_width(width);
     let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+    let elided = galley.elided;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, galley.size().y), Sense::hover());
     ui.painter().galley(rect.left_top(), galley, TEXT);
+    elided
 }
 
 fn show_full_card(ui: &mut egui::Ui, row: &LoadoutView, scale: Scale) {
@@ -1490,6 +2763,277 @@ mod tests {
         );
         assert_eq!(read(&file, "loadouts-full"), Some(full));
         fs::remove_file(file).unwrap();
+    }
+
+    #[test]
+    fn opens_a_window_at_the_pixels_it_was_left_at_whatever_the_monitors_scale() {
+        // The overlay has zoomed out for a game at 1920x1080. The window was left at 100%,
+        // on a monitor to the right of a primary at 150%.
+        let scale = Scale(1.0 / 0.75);
+        let left_at = [3948.0, 641.0];
+        let measured = scale.to_points(left_at, 1.0);
+        let stored = scale.to_pixels(measured, 1.0);
+        assert_eq!(stored, left_at);
+
+        // egui-winit turns the position asked for into pixels at zoom times the scale of
+        // the monitor the window is on, here still the primary at 150%, and winit rounds.
+        let asked = scale.to_points(stored, 1.5);
+        assert_eq!(asked.map(|v| (v * 0.75 * 1.5).round()), left_at);
+    }
+
+    const MADURAI: &str = "/Lotus/Upgrades/Focus/Attack/AttackFocusAbility";
+    const ZENURIK: &str = "/Lotus/Upgrades/Focus/Power/PowerFocusAbility";
+    const SARYN: &str = "/Lotus/Powersuits/Saryn/Saryn";
+    const MESA: &str = "/Lotus/Powersuits/Cowgirl/Cowgirl";
+    const KAVAT: &str = "/Lotus/Types/Game/CatbrowPet/CheshireCatbrowPetPowerSuit";
+
+    fn met(
+        name: &str,
+        platform: &str,
+        [country_code, country]: [&str; 2],
+        focus: Option<&str>,
+        warframe: &str,
+        companion: Option<&str>,
+    ) -> HistoryEntry {
+        HistoryEntry {
+            at: 0,
+            when: String::new(),
+            file: String::new(),
+            location: String::new(),
+            mission_type: String::new(),
+            view: LoadoutView {
+                name: name.to_owned(),
+                platform: platform.to_owned(),
+                country_code: country_code.to_owned(),
+                country: country.to_owned(),
+                loadout: Some(Loadout {
+                    warframe: item(warframe, None, None),
+                    companion: companion.and_then(|path| item(path, None, None)),
+                    operator: focus.map(|path| Operator {
+                        drifter: true,
+                        focus: Some(path.to_owned()),
+                    }),
+                    ..Loadout::default()
+                }),
+                ..LoadoutView::default()
+            },
+        }
+    }
+
+    /// Five departures, one player among them met twice.
+    fn departures() -> [HistoryEntry; 5] {
+        const US: [&str; 2] = ["US", "United States of America"];
+        const JP: [&str; 2] = ["JP", "Japan"];
+        [
+            met("Ordis", "PS", JP, Some(ZENURIK), MESA, None),
+            met("Tenno", "PC", US, Some(MADURAI), SARYN, Some(KAVAT)),
+            met("Lotus", "PC", JP, Some(ZENURIK), SARYN, None),
+            // Written down before the operator and the country were: counted for neither.
+            met("Teshin", "Xbox", ["", ""], None, MESA, None),
+            met("Tenno", "PC", US, Some(MADURAI), SARYN, None),
+        ]
+    }
+
+    #[test]
+    fn adds_the_history_up_most_first() {
+        let tally = tally(&departures());
+
+        let counts = |statistic: Statistic| {
+            let counted = &tally.kinds[statistic.index()];
+            let shares = counted
+                .shares
+                .iter()
+                .map(|share| (share.key.clone(), share.count))
+                .collect::<Vec<_>>();
+            (counted.players, shares)
+        };
+        let owned = |shares: &[(&str, usize)]| {
+            shares
+                .iter()
+                .map(|(key, count)| (key.to_string(), *count))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(tally.loadouts, 5);
+        assert_eq!(
+            counts(Statistic::Platforms),
+            (5, owned(&[("PC", 3), ("PS", 1), ("Xbox", 1)])),
+            "most first, and those met as often in the order of their names"
+        );
+        assert_eq!(
+            counts(Statistic::Countries),
+            (4, owned(&[("JP", 2), ("US", 2)])),
+            "counted by code, and only where it is known"
+        );
+        assert_eq!(
+            tally.kinds[Statistic::Countries.index()].shares[1].label,
+            "United States of America",
+            "shown by name"
+        );
+        assert_eq!(
+            counts(Statistic::Focus),
+            (4, owned(&[(MADURAI, 2), (ZENURIK, 2)]))
+        );
+        let (players, warframes) = counts(Statistic::Slot(0));
+        assert_eq!(players, 5);
+        assert_eq!(
+            warframes
+                .iter()
+                .map(|(_, count)| *count)
+                .collect::<Vec<_>>(),
+            [3, 2],
+            "Saryn three times, Mesa twice"
+        );
+        assert_eq!(
+            counts(Statistic::Slot(4)).0,
+            1,
+            "an empty companion slot is not counted"
+        );
+    }
+
+    #[test]
+    fn keeps_the_statistics_in_the_order_they_are_indexed_by() {
+        for (index, (statistic, _)) in STATS.iter().enumerate() {
+            assert_eq!(statistic.index(), index, "{statistic:?}");
+        }
+    }
+
+    #[test]
+    fn narrows_the_list_to_the_picks_and_the_name() {
+        let history = departures();
+        let platforms = Statistic::Platforms.index();
+        let mut filter = Filter::default();
+        assert!(filter.is_empty());
+        assert_eq!(
+            filter.apply(&history),
+            [0, 1, 2, 3, 4],
+            "nothing picked lets everyone through"
+        );
+
+        toggle(&mut filter.picked[platforms], "PC");
+        toggle(&mut filter.picked[platforms], "PS");
+        assert_eq!(filter.apply(&history), [0, 1, 2, 4], "either platform");
+
+        toggle(&mut filter.picked[Statistic::Countries.index()], "JP");
+        assert_eq!(filter.apply(&history), [0, 2], "and from Japan too");
+
+        filter.name = " LOT ".to_owned();
+        assert_eq!(
+            filter.apply(&history),
+            [2],
+            "and a name holding what is typed, whatever its case"
+        );
+
+        toggle(&mut filter.picked[platforms], "PC");
+        assert!(
+            filter.apply(&history).is_empty(),
+            "a toggle picked again lets it go: Lotus plays on PC"
+        );
+        assert!(!filter.is_empty());
+
+        let mut filter = Filter::default();
+        toggle(&mut filter.picked[Statistic::Focus.index()], MADURAI);
+        assert_eq!(filter.apply(&history), [1, 4]);
+
+        let mut filter = Filter::default();
+        let mesa = Statistic::Slot(0).key(&history[0]).unwrap();
+        toggle(&mut filter.picked[Statistic::Slot(0).index()], mesa);
+        assert_eq!(filter.apply(&history), [0, 3]);
+    }
+
+    #[test]
+    fn adds_up_only_what_the_list_shows_when_asked() {
+        let history: Arc<[HistoryEntry]> = Arc::from(departures());
+        let mut shown = Shown {
+            history: Arc::clone(&history),
+            ..Shown::default()
+        };
+        let platforms = Statistic::Platforms.index();
+        let players = |shown: &Shown| {
+            let (_, _, tally) = shown.tally.as_ref().unwrap();
+            (tally.kinds[platforms].players, tally.loadouts)
+        };
+        toggle(&mut shown.filter.picked[platforms], "PC");
+
+        refresh_tally(&mut shown, &history);
+        assert_eq!(
+            players(&shown),
+            (5, 5),
+            "every entry, whatever the list shows"
+        );
+
+        shown.scope = Scope::Listed;
+        refresh_tally(&mut shown, &history);
+        assert_eq!(players(&shown), (3, 3), "only the three on PC");
+
+        toggle(&mut shown.filter.picked[platforms], "PS");
+        refresh_tally(&mut shown, &history);
+        assert_eq!(
+            players(&shown),
+            (4, 4),
+            "added up again as the filter changes"
+        );
+    }
+
+    #[test]
+    fn narrows_the_list_to_a_node_and_a_mission_type() {
+        let mut history = departures();
+        let mut tie = |index: usize, location: &str, mission_type: &str| {
+            history[index].location = location.to_owned();
+            history[index].mission_type = mission_type.to_owned();
+        };
+        tie(0, "SolNode228", "MT_LANDSCAPE");
+        tie(1, "SolNode27", "MT_EXTERMINATION");
+        tie(2, "EventNode12", "MT_SURVIVAL");
+        // The last two were written down before missions were.
+
+        let mut filter = Filter::default();
+        for (typed, expected, why) in [
+            (" eidolon ", &[0][..], "by the node's name, ignoring case"),
+            ("EARTH", &[0, 1][..], "the system is in the name"),
+            ("solnode27", &[1][..], "or by its id"),
+            ("eventnode", &[2][..], "a node the export lacks, by its id"),
+        ] {
+            filter.node = typed.to_owned();
+            assert_eq!(filter.apply(&history), expected, "{why}");
+        }
+
+        filter.node.clear();
+        filter.mission_type = Some("MT_EXTERMINATION".to_owned());
+        assert_eq!(filter.apply(&history), [1]);
+        assert!(!filter.is_empty());
+    }
+
+    #[test]
+    fn finds_the_slice_under_the_pointer() {
+        let share = |key: &str, count| Share {
+            key: key.to_owned(),
+            label: key.to_owned(),
+            count,
+        };
+        let shares = [share("PC", 3), share("PS", 1)];
+        // Laid clockwise from the top: the first three quarters, then the last.
+        assert_eq!(slice_at(&shares, egui::vec2(1.0, -10.0), 20.0), Some(0));
+        assert_eq!(slice_at(&shares, egui::vec2(10.0, 1.0), 20.0), Some(0));
+        assert_eq!(slice_at(&shares, egui::vec2(-1.0, 10.0), 20.0), Some(0));
+        assert_eq!(slice_at(&shares, egui::vec2(-10.0, -1.0), 20.0), Some(1));
+        assert_eq!(
+            slice_at(&shares, egui::vec2(30.0, 0.0), 20.0),
+            None,
+            "off the pie"
+        );
+    }
+
+    #[test]
+    fn drops_a_placement_no_monitor_shows() {
+        let placement = |x, y| Placement {
+            x,
+            y,
+            width: 820.0,
+            height: 900.0,
+        };
+        // The primary monitor's corner is where the desktop's pixels count from.
+        assert!(on_screen(placement(0.0, 0.0)));
+        assert!(!on_screen(placement(-100_000.0, -100_000.0)));
     }
 
     #[test]
