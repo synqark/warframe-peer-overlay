@@ -673,8 +673,8 @@ fn referrers(process: &Process, found: &HashMap<u64, Found>) -> Vec<(usize, u64)
             let want = CHUNK.min(size - offset);
             if let Some(data) = process.read(base + offset, want) {
                 // Regions start on a page, so every eighth byte starts an aligned word.
-                for (index, word) in data.chunks_exact(8).enumerate() {
-                    let value = usize::from_le_bytes(word.try_into().expect("eight bytes"));
+                for (index, word) in data.as_chunks::<8>().0.iter().enumerate() {
+                    let value = usize::from_le_bytes(*word);
                     if (low..=high).contains(&value)
                         && let Ok(at) =
                             strings.binary_search_by_key(&value, |(address, _)| *address)
