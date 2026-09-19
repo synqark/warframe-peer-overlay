@@ -72,6 +72,9 @@ const LOADOUT_HEAD: &[u8] = br#"{"PlayerLevel":"#;
 const MAX_LOADOUT: usize = 1024 * 1024;
 /// Read granularity. Chunks overlap by the head's length so no head is split unseen.
 const CHUNK: usize = 32 * 1024 * 1024;
+/// The unit memory is committed and freed in, and so what a chunk that failed to read is read
+/// again by (`Process::read_pages`).
+const PAGE: usize = 4096;
 /// Anything larger is graphics or mapped memory, never the heap strings wanted here.
 const MAX_REGION: usize = 512 * 1024 * 1024;
 /// How often work that found nothing is retried, and for how long a member is looked for.
@@ -580,7 +583,7 @@ fn census(process: &Process) -> HashMap<u64, Found> {
             let want = CHUNK.min(size - offset);
             let last = offset + want >= size;
             let chunk_base = base + offset;
-            if let Some(data) = process.read(chunk_base, want) {
+            if let Some(data) = process.read_pages(chunk_base, want) {
                 // A head in the overlap is met again at the start of the next chunk.
                 let accept_before = if last {
                     data.len()
@@ -671,7 +674,7 @@ fn referrers(process: &Process, found: &HashMap<u64, Found>) -> Vec<(usize, u64)
         let mut offset = 0;
         while offset < size {
             let want = CHUNK.min(size - offset);
-            if let Some(data) = process.read(base + offset, want) {
+            if let Some(data) = process.read_pages(base + offset, want) {
                 // Regions start on a page, so every eighth byte starts an aligned word.
                 for (index, word) in data.as_chunks::<8>().0.iter().enumerate() {
                     let value = usize::from_le_bytes(*word);
@@ -1001,6 +1004,31 @@ impl Process {
         buffer.truncate(read);
         Some(buffer)
     }
+
+    /// Reads a chunk of a region as `read` does, standing up to the region having changed
+    /// since it was listed. The target frees and commits pages as it runs, and a read that
+    /// meets a single page gone fails as a whole (`ERROR_PARTIAL_COPY`, nothing copied), which
+    /// would cost everything else in the chunk. So a chunk that fails is read again a page at
+    /// a time, the pages that are gone left as zeros: offsets stay where they were, and a zero
+    /// ends whatever string runs into one. `None` only when no page of it can be read.
+    fn read_pages(&self, address: usize, len: usize) -> Option<Vec<u8>> {
+        if let Some(data) = self.read(address, len) {
+            return Some(data);
+        }
+        let mut data = vec![0_u8; len];
+        let mut any = false;
+        let mut offset = 0;
+        while offset < len {
+            // Up to the next page boundary: a chunk need not start on one.
+            let page = (PAGE - (address + offset) % PAGE).min(len - offset);
+            if let Some(bytes) = self.read(address + offset, page) {
+                data[offset..offset + bytes.len()].copy_from_slice(&bytes);
+                any = true;
+            }
+            offset += page;
+        }
+        any.then_some(data)
+    }
 }
 
 impl Drop for Process {
@@ -1224,6 +1252,63 @@ mod tests {
         );
 
         assert_eq!(found[&content_hash(&suit)].json, suit);
+    }
+
+    #[test]
+    fn reads_around_a_page_that_has_gone() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let size = 3 * PAGE;
+        // SAFETY: a region of this test's own, written and freed only here.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                size,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        }
+        .cast::<u8>();
+        assert!(!base.is_null());
+        unsafe {
+            std::ptr::write_bytes(base, 7, size);
+            // The middle page goes, as the game's do while a pass reads its memory.
+            VirtualFree(base.add(PAGE).cast(), PAGE, MEM_DECOMMIT);
+        }
+        let process = Process::open(std::process::id()).expect("a process may read itself");
+        let address = base as usize;
+
+        assert_eq!(
+            process.read(address, size),
+            None,
+            "one read fails as a whole"
+        );
+        let data = process
+            .read_pages(address, size)
+            .expect("two pages are left");
+        assert!(data[..PAGE].iter().all(|&byte| byte == 7));
+        assert!(data[PAGE..2 * PAGE].iter().all(|&byte| byte == 0));
+        assert!(data[2 * PAGE..].iter().all(|&byte| byte == 7));
+        // Not starting on a page, as every chunk but a region's first does not.
+        let data = process
+            .read_pages(address + 100, size - 100)
+            .expect("two pages are left");
+        assert_eq!(data.len(), size - 100);
+        assert!(data[..PAGE - 100].iter().all(|&byte| byte == 7));
+        assert!(
+            data[PAGE - 100..2 * PAGE - 100]
+                .iter()
+                .all(|&byte| byte == 0)
+        );
+        assert!(data[2 * PAGE - 100..].iter().all(|&byte| byte == 7));
+
+        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+        assert_eq!(
+            process.read_pages(address, size),
+            None,
+            "nothing left to read"
+        );
     }
 
     #[test]
