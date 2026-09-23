@@ -126,7 +126,8 @@ fn run(sender: Sender<MonitorSnapshot>, geo_enabled: bool) {
     let mut written_down = Arc::<[HistoryEntry]>::from(history.entries());
     // The squad as the last pass round saw it, to tell who has left it since.
     let mut squad = HashMap::<String, LoadoutView>::new();
-    let mut departures = 0_u64;
+    // How many players the history has been given, to tell a snapshot it has more to show.
+    let mut records = 0_u64;
     let mut seen_own_builds = 0;
     let mut seen_other_builds = 0;
     let mut file_position = 0;
@@ -167,6 +168,8 @@ fn run(sender: Sender<MonitorSnapshot>, geo_enabled: bool) {
         }
         was_running = running;
 
+        // Whether a mission's session ended in what was read this time round.
+        let mut session_ended = false;
         let status = if !running {
             "Warframeを待機中".to_owned()
         } else if !log_path.exists() {
@@ -179,7 +182,10 @@ fn run(sender: Sender<MonitorSnapshot>, geo_enabled: bool) {
                 &mut parser,
                 &mut missions,
             ) {
-                Ok(()) => "EE.logを監視中".to_owned(),
+                Ok(()) => {
+                    session_ended = missions.sessions_ended();
+                    "EE.logを監視中".to_owned()
+                }
                 Err(error) => format!("EE.log読み取りエラー: {error}"),
             }
         };
@@ -302,35 +308,55 @@ fn run(sender: Sender<MonitorSnapshot>, geo_enabled: bool) {
         // A change seen while they were here is no longer theirs to show if they come back:
         // whoever joins again is shown what their JOIN announces, until they change it again.
         member_updates.retain(|name, _| !squad.contains_key(name) || members.contains_key(name));
+        // A session's end writes down everyone still in the squad it tied, with the loadout
+        // they played it in: a squad that stays together is written down once a mission, not
+        // only when it comes apart. It unties them, so leaving afterwards writes nothing down
+        // twice, and the next mission ties them afresh. Their loadout's file stays as it is,
+        // for the entries a later mission makes of the same gear.
+        let mut written = false;
+        if session_ended {
+            let mut finished = members.values().cloned().collect::<Vec<_>>();
+            finished.sort_by(|one, other| one.name.cmp(&other.name));
+            for view in finished {
+                let tie = missions.tie(&view.name).cloned();
+                if let Some(mission) = tie.filter(|_| view.loadout.is_some()) {
+                    let file = saved.get(&view.name).cloned().unwrap_or_default();
+                    missions.untie(&view.name);
+                    history.record(view, file, &mission);
+                    records += 1;
+                    written = true;
+                }
+            }
+        }
         let left = squad
             .values()
             .filter(|view| !members.contains_key(&view.name) && view.loadout.is_some())
             .cloned()
             .collect::<Vec<_>>();
         if !left.is_empty() {
-            let mut written = false;
             for view in left {
                 let file = saved.remove(&view.name).unwrap_or_default();
                 // Only a member who played a mission with us is written down, with the mission
                 // they were last tied to, which outlives their leaving. One who left before any
-                // mission started is let go, and the loadout saved for them with them.
+                // mission started — or who was written down by its end and has played none
+                // since — is let go, and the loadout saved for them with them.
                 if let Some(mission) = missions.tie(&view.name).cloned() {
                     history.record(view, file, &mission);
-                    departures += 1;
+                    records += 1;
                     written = true;
                 }
             }
-            if written {
-                history.save();
-                written_down = Arc::from(history.entries());
-            }
             discard_what_nothing_shows(&history, &saved);
+        }
+        if written {
+            history.save();
+            written_down = Arc::from(history.entries());
         }
         squad = members;
         let recent_missions = Vec::from(missions.missions().clone());
         let squad_ties = missions.squad_ties();
         let signature = format!(
-            "{running}:{status}:{peers:?}:{window_rect:?}:{loadout_cards:?}:{departures}:{recent_missions:?}:{squad_ties:?}"
+            "{running}:{status}:{peers:?}:{window_rect:?}:{loadout_cards:?}:{records}:{recent_missions:?}:{squad_ties:?}"
         );
         if signature != last_signature {
             if sender

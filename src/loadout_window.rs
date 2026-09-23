@@ -30,6 +30,8 @@ use eframe::egui::{
     StrokeKind, TextFormat, UiBuilder, ViewportBuilder, ViewportClass, ViewportCommand, ViewportId,
     text::{LayoutJob, TextWrapping},
 };
+use egui_extras::DatePickerButton;
+use jiff::civil::Date;
 use serde::{Deserialize, Serialize};
 use warframe_peer_overlay::{
     history::HistoryEntry,
@@ -176,6 +178,8 @@ const MASTERY_WIDTH: f32 = 52.0;
 const PLATFORM_WIDTH: f32 = 42.0;
 const NODE_WIDTH: f32 = 170.0;
 const MISSION_TYPE_WIDTH: f32 = 130.0;
+/// How a day is written, in the history and on the buttons the dates are picked with.
+const DAY: &str = "%Y-%m-%d";
 /// The history's statistics: cells in a grid `STATS_COLUMNS` wide and `STATS_ROWS` tall, each
 /// at `[column, row]`, with `STATS_GAP` between them and the list. They stand in the order of
 /// `Statistic::index`.
@@ -1079,31 +1083,30 @@ fn show_history(ui: &mut egui::Ui, shown: &mut Shown) {
         .inner_margin(scale.margin(10.0, 10.0))
         .show(ui, |ui| {
             let area = ui.available_rect_before_wrap();
-            let list = egui::Rect::from_min_size(
+            // One line across both sides: the filters over the list's columns, the range of
+            // dates beside them, and what the statistics add up at the far right.
+            let header = egui::Rect::from_min_size(
                 area.min,
-                egui::vec2(scale.px(LIST_WIDTH), area.height()),
+                egui::vec2(area.width(), filter_height(ui, scale)),
             );
-            let statistics = egui::Rect::from_min_max(
-                egui::pos2(list.right() + scale.px(STATS_GAP), area.top()),
+            let body = egui::Rect::from_min_max(
+                egui::pos2(area.left(), header.bottom() + scale.px(STATS_GAP)),
                 area.max,
             );
-            // The statistics first: what is picked there narrows the list in the same pass.
+            let list = egui::Rect::from_min_size(
+                body.min,
+                egui::vec2(scale.px(LIST_WIDTH), body.height()),
+            );
+            let statistics = egui::Rect::from_min_max(
+                egui::pos2(list.right() + scale.px(STATS_GAP), body.top()),
+                body.max,
+            );
             let room = statistics.width() > 0.0;
-            if room {
-                // A line as tall as the list's filters, to choose what the statistics add up.
-                let bar = egui::Rect::from_min_size(
-                    statistics.min,
-                    egui::vec2(statistics.width(), filter_height(ui, scale)),
-                );
-                let cells = egui::Rect::from_min_max(
-                    egui::pos2(statistics.left(), bar.bottom() + scale.px(STATS_GAP)),
-                    statistics.max,
-                );
-                show_scope(ui, bar, &mut shown.scope, scale);
-                refresh_tally(shown, &history);
-                if let Some((_, _, tally)) = &shown.tally {
-                    show_statistics(ui, cells, tally, &mut shown.filter, scale);
-                }
+            show_history_header(ui, header, &mut shown.filter, &mut shown.scope, scale);
+            // The statistics before the list: what is picked there narrows it in the same pass.
+            refresh_tally(shown, &history);
+            if room && let Some((_, _, tally)) = &shown.tally {
+                show_statistics(ui, statistics, tally, &mut shown.filter, scale);
             }
             let mut left = ui.new_child(
                 UiBuilder::new()
@@ -1198,26 +1201,21 @@ fn filter_height(ui: &egui::Ui, scale: Scale) -> f32 {
     line + scale.margin(6.0, 3.0).sum().y
 }
 
-/// The line over the statistics: against its right edge, which of the history they add up,
-/// every entry or only those the list shows.
-fn show_scope(ui: &mut egui::Ui, bar: egui::Rect, scope: &mut Scope, scale: Scale) {
-    let mut line = ui.new_child(
-        UiBuilder::new()
-            .id_salt("statistics-scope")
-            .max_rect(bar)
-            .layout(egui::Layout::right_to_left(egui::Align::Center)),
-    );
-    line.spacing_mut().button_padding = egui::vec2(scale.px(8.0), scale.px(3.0));
-    line.spacing_mut().item_spacing.x = scale.px(4.0);
-    // Laid down from the right, so the last choice goes first to leave them in order.
-    line.selectable_value(
-        scope,
-        Scope::Listed,
-        single("検索データのみ", 12.0, TEXT, scale),
-    );
-    line.selectable_value(scope, Scope::All, single("全データ", 12.0, TEXT, scale));
-    line.add_space(scale.px(4.0));
-    line.label(single("統計表示対象データ：", 12.0, MUTED, scale));
+/// Against the right end of the header line, which of the history the statistics add up:
+/// every entry, or only those the list shows.
+fn show_scope(ui: &mut egui::Ui, scope: &mut Scope, scale: Scale) {
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.spacing_mut().button_padding = egui::vec2(scale.px(8.0), scale.px(3.0));
+        // Laid down from the right, so the last choice goes first to leave them in order.
+        ui.selectable_value(
+            scope,
+            Scope::Listed,
+            single("検索データのみ", 12.0, TEXT, scale),
+        );
+        ui.selectable_value(scope, Scope::All, single("全データ", 12.0, TEXT, scale));
+        ui.add_space(scale.px(4.0));
+        ui.label(single("統計表示対象データ：", 12.0, MUTED, scale));
+    });
 }
 
 /// The session window: the mission loaded last set out at length and whether its session
@@ -1426,7 +1424,6 @@ fn show_history_list<'a>(
         ));
         return None;
     }
-    show_list_header(ui, &mut shown.filter, scale);
     refresh_listed(shown, history);
     let listed = shown
         .listed
@@ -1460,44 +1457,105 @@ fn show_history_list<'a>(
     clicked
 }
 
-/// The list's header: over each column with a filter, that filter, lined up with the column's
-/// cells - a box to search by name over the columns that say who a player was, one to search
-/// by the mission's node over its column, and a menu of the mission types over theirs - and,
-/// against the right edge, a button that lets every filter go, the picks in the statistics
-/// included.
-fn show_list_header(ui: &mut egui::Ui, filter: &mut Filter, scale: Scale) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().button_padding = egui::vec2(scale.px(8.0), scale.px(3.0));
-        let gap = ui.spacing().item_spacing.x;
-        // In from the edge as far as a row's margin sets its cells.
-        ui.add_space(f32::from(scale.margin(ROW_MARGIN[0], ROW_MARGIN[1]).left));
-        let who = scale.px(NAME_WIDTH + MASTERY_WIDTH + PLATFORM_WIDTH) + 2.0 * gap;
-        search_box(
-            ui,
-            &mut filter.name,
-            "history-name",
-            "名前で検索",
-            who,
-            scale,
-        );
-        let node = scale.px(NODE_WIDTH);
-        search_box(
-            ui,
-            &mut filter.node,
-            "history-node",
-            "ノードで検索",
-            node,
-            scale,
-        );
-        mission_type_menu(ui, &mut filter.mission_type, scale);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let clear = egui::Button::new(single("絞り込み解除", 12.0, TEXT, scale));
-            if ui.add_enabled(!filter.is_empty(), clear).clicked() {
-                *filter = Filter::default();
-            }
-        });
-    });
-    ui.add_space(scale.px(2.0));
+/// The line across the top of both sides, as tall as a box to type in: the filters of the
+/// list's columns lined up with their cells, then the dates a match must fall between and the
+/// button that lets every filter go — there being no room over the list for two dates, that
+/// much of the line runs on past it — and, against the far right, what the statistics add up.
+fn show_history_header(
+    ui: &mut egui::Ui,
+    header: egui::Rect,
+    filter: &mut Filter,
+    scope: &mut Scope,
+    scale: Scale,
+) {
+    let mut line = ui.new_child(
+        UiBuilder::new()
+            .id_salt("history-header")
+            .max_rect(header)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    line.spacing_mut().button_padding = egui::vec2(scale.px(8.0), scale.px(3.0));
+    show_list_filters(&mut line, filter, scale);
+    show_dates(&mut line, filter, scale);
+    line.add_space(scale.px(4.0));
+    let clear = egui::Button::new(single("絞り込み解除", 12.0, TEXT, scale));
+    if line.add_enabled(!filter.is_empty(), clear).clicked() {
+        *filter = Filter::default();
+    }
+    show_scope(&mut line, scope, scale);
+}
+
+/// The filters over the list's own columns: a box to search by name over the columns that say
+/// who a player was, one to search by the mission's node over its column, and a menu of the
+/// mission types over theirs.
+fn show_list_filters(ui: &mut egui::Ui, filter: &mut Filter, scale: Scale) {
+    let gap = ui.spacing().item_spacing.x;
+    // In from the edge as far as a row's margin sets its cells.
+    ui.add_space(f32::from(scale.margin(ROW_MARGIN[0], ROW_MARGIN[1]).left));
+    let who = scale.px(NAME_WIDTH + MASTERY_WIDTH + PLATFORM_WIDTH) + 2.0 * gap;
+    search_box(
+        ui,
+        &mut filter.name,
+        "history-name",
+        "名前で検索",
+        who,
+        scale,
+    );
+    let node = scale.px(NODE_WIDTH);
+    search_box(
+        ui,
+        &mut filter.node,
+        "history-node",
+        "ノードで検索",
+        node,
+        scale,
+    );
+    mission_type_menu(ui, &mut filter.mission_type, scale);
+}
+
+/// The two dates between which the list keeps a match, both of them part of the range and
+/// neither set to begin with.
+fn show_dates(ui: &mut egui::Ui, filter: &mut Filter, scale: Scale) {
+    show_date(ui, &mut filter.from, "開始日", "history-from", scale);
+    ui.label(single("〜", 12.0, MUTED, scale));
+    show_date(ui, &mut filter.to, "終了日", "history-to", scale);
+}
+
+/// One end of the range: a button opening a calendar to pick a date from (`egui_extras`),
+/// showing the date it is set to, and a cross beside it to let that date go again. The
+/// calendar opens on today while the end is not set, and the button says which end it is —
+/// a format is written out as it stands but for what follows a `%`.
+fn show_date(
+    ui: &mut egui::Ui,
+    bound: &mut Option<Date>,
+    which: &'static str,
+    salt: &'static str,
+    scale: Scale,
+) {
+    let mut date = bound.unwrap_or_else(today);
+    let picker = DatePickerButton::new(&mut date)
+        .id_salt(salt)
+        .format(if bound.is_some() { "%Y-%m-%d" } else { which })
+        .calendar_week(false)
+        .highlight_weekends(false);
+    if ui.add(picker).changed() {
+        *bound = Some(date);
+    }
+    if bound.is_some() {
+        let cross = egui::Button::new(single("×", 12.0, MUTED, scale));
+        if ui
+            .add(cross)
+            .on_hover_text(format!("{which}を外す"))
+            .clicked()
+        {
+            *bound = None;
+        }
+    }
+}
+
+/// Today, which the calendar opens on while an end of the range is not set.
+fn today() -> Date {
+    jiff::Zoned::now().date()
 }
 
 /// A box to type a search into, `width` wide.
@@ -1508,7 +1566,7 @@ fn search_box(
     hint: &str,
     width: f32,
     scale: Scale,
-) {
+) -> egui::Response {
     ui.add(
         egui::TextEdit::singleline(text)
             .id_salt(id)
@@ -1516,7 +1574,7 @@ fn search_box(
             .font(egui::FontId::proportional(scale.px(13.0)))
             .margin(scale.margin(6.0, 3.0))
             .desired_width(width),
-    );
+    )
 }
 
 /// The menu of every mission type the export names, in the order of their names, over the
@@ -2106,6 +2164,10 @@ fn focus_color(path: &str) -> Color32 {
 struct Filter {
     name: String,
     node: String,
+    /// The dates a match must fall between, each `None` for no bound and both part of the
+    /// range (`within`).
+    from: Option<Date>,
+    to: Option<Date>,
     /// By id, `MT_LANDSCAPE`.
     mission_type: Option<String>,
     /// The keys picked in each kind of statistic (`Statistic::index`).
@@ -2116,6 +2178,8 @@ impl Filter {
     fn is_empty(&self) -> bool {
         self.name.trim().is_empty()
             && self.node.trim().is_empty()
+            && self.from.is_none()
+            && self.to.is_none()
             && self.mission_type.is_none()
             && self.picked.iter().all(BTreeSet::is_empty)
     }
@@ -2124,12 +2188,15 @@ impl Filter {
     fn apply(&self, history: &[HistoryEntry]) -> Vec<usize> {
         let needle = |typed: &str| typed.trim().to_lowercase();
         let (name, node) = (needle(&self.name), needle(&self.node));
+        let day = |bound: &Option<Date>| bound.map(|date| date.strftime(DAY).to_string());
+        let (from, to) = (day(&self.from), day(&self.to));
         let holds = |text: &str, needle: &str| text.to_lowercase().contains(needle);
         history
             .iter()
             .enumerate()
             .filter(|(_, entry)| {
-                (name.is_empty() || holds(&entry.view.name, &name))
+                within(&entry.when, from.as_deref(), to.as_deref())
+                    && (name.is_empty() || holds(&entry.view.name, &name))
                     && (node.is_empty()
                         || !entry.location.is_empty()
                             && (holds(&entry.location, &node)
@@ -2148,6 +2215,14 @@ impl Filter {
             .map(|(index, _)| index)
             .collect()
     }
+}
+
+/// Whether a match written down at `when` (`2026-09-19 15:32`) falls between the two days,
+/// each `None` for no bound and both part of the range. A day written this way sorts as it
+/// runs, from its widest part to its narrowest, so the dates need no calendar to compare.
+fn within(when: &str, from: Option<&str>, to: Option<&str>) -> bool {
+    let day = |bound: &str| when.get(..bound.len()).unwrap_or(when);
+    from.is_none_or(|from| day(from) >= from) && to.is_none_or(|to| day(to) <= to)
 }
 
 /// Picks `key`, or lets it go if it was picked.
@@ -2719,6 +2794,8 @@ fn path_tail(path: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use jiff::civil::date;
+
     use super::*;
 
     fn item(path: &str, rank: Option<u64>, forma: Option<u64>) -> Option<Item> {
@@ -3001,6 +3078,57 @@ mod tests {
         filter.mission_type = Some("MT_EXTERMINATION".to_owned());
         assert_eq!(filter.apply(&history), [1]);
         assert!(!filter.is_empty());
+    }
+
+    #[test]
+    fn keeps_a_match_between_the_days_picked() {
+        let when = "2026-09-19 15:32";
+        let day = |date: Date| date.strftime(DAY).to_string();
+        let (before, that_day, after) = (
+            day(date(2026, 9, 18)),
+            day(date(2026, 9, 19)),
+            day(date(2026, 9, 20)),
+        );
+        for (from, to, kept, why) in [
+            (None, None, true, "no bound either end"),
+            (Some(&that_day), None, true, "the day it was, as the start"),
+            (None, Some(&that_day), true, "and as the end"),
+            (Some(&after), None, false, "the day after"),
+            (None, Some(&before), false, "the day before"),
+            (Some(&before), Some(&after), true, "the days around it"),
+        ] {
+            let (from, to) = (from.map(String::as_str), to.map(String::as_str));
+            assert_eq!(within(when, from, to), kept, "{from:?}〜{to:?}: {why}");
+        }
+    }
+
+    #[test]
+    fn narrows_the_list_to_the_days_picked() {
+        let mut history = departures();
+        history[0].when = "2026-09-18 22:04".to_owned();
+        history[1].when = "2026-09-19 15:32".to_owned();
+        history[2].when = "2026-09-19 21:00".to_owned();
+        history[3].when = "2026-10-01 09:15".to_owned();
+        history[4].when = "2026-10-02 09:15".to_owned();
+
+        let mut filter = Filter {
+            from: Some(date(2026, 9, 19)),
+            ..Filter::default()
+        };
+        assert_eq!(filter.apply(&history), [1, 2, 3, 4], "from that day on");
+        filter.to = Some(date(2026, 9, 19));
+        assert_eq!(
+            filter.apply(&history),
+            [1, 2],
+            "that day alone, both ends kept"
+        );
+        assert!(!filter.is_empty());
+
+        let filter = Filter {
+            to: Some(date(2026, 9, 30)),
+            ..Filter::default()
+        };
+        assert_eq!(filter.apply(&history), [0, 1, 2], "up to the month's end");
     }
 
     #[test]

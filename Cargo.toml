@@ -16,7 +16,10 @@ base64 = "0.22"
 directories = "6.0"
 # `wayland`/`x11` are deliberately omitted: this binary is Windows-only.
 eframe = { version = "0.36.1", default-features = false, features = ["default_fonts", "glow"] }
-egui_extras = { version = "0.36.1", default-features = false, features = ["svg"] }
+# `datepicker`: the calendar the history's dates are picked from, which brings in `jiff`.
+egui_extras = { version = "0.36.1", default-features = false, features = ["svg", "datepicker"] }
+# The dates the history is narrowed to, as the date picker keeps them.
+jiff = { version = "0.2", default-features = false, features = ["std", "tz-system"] }
 iso_country = "0.1.4"
 # Finds loadout strings in the game's memory. Already built as part of `regex`.
 memchr = "2"

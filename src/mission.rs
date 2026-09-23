@@ -57,6 +57,10 @@ pub enum Ending {
 
 #[derive(Default)]
 pub struct MissionTracker {
+    /// How many sessions have ended, and how many of those the monitor has been told of;
+    /// `None` until it has caught up with a log read from its start (`sessions_ended`).
+    endings: u64,
+    told: Option<u64>,
     /// The newest last.
     missions: VecDeque<Mission>,
     /// A mission whose block of details is still being read; kept once the block shows its
@@ -81,6 +85,27 @@ impl MissionTracker {
         self.missions.clear();
         self.loading = None;
         self.squad.clear();
+        self.told = None;
+    }
+
+    /// Whether a session has ended since this was last asked, for the monitor to write down
+    /// everyone it tied. The first time it is asked after the log has been read from its
+    /// start — a run beginning, or the log rotating — nothing is reported and the ties to
+    /// sessions already ended are let go: those were written down, if at all, by the run that
+    /// watched them end.
+    pub fn sessions_ended(&mut self) -> bool {
+        let Some(told) = self.told.replace(self.endings) else {
+            // Caught up: every tie but one to the session still going on is let go.
+            let ongoing = self.ongoing().cloned();
+            self.ties.retain(|_, tie| Some(&*tie) == ongoing.as_ref());
+            return false;
+        };
+        self.endings > told
+    }
+
+    /// Lets a member's tie go, once the history has written them down with it.
+    pub fn untie(&mut self, member: &str) {
+        self.ties.remove(member);
     }
 
     /// The newest mission, while its session goes on.
@@ -132,6 +157,7 @@ impl MissionTracker {
                 by,
                 at: time.to_owned(),
             });
+            self.endings += 1;
             changed = true;
         }
         changed
@@ -459,6 +485,54 @@ info={
                 ("Ordis".to_owned(), Some("SolNode6".to_owned())),
                 ("Teshin".to_owned(), Some("SolNode6".to_owned())),
             ]
+        );
+    }
+
+    #[test]
+    fn tells_of_a_session_ending_once_it_has_caught_up_with_the_log() {
+        let mut tracker = MissionTracker::default();
+        feed(&mut tracker, HOST);
+        tracker.tie_squad(["Ordis"]);
+        tracker.process_line(EOM);
+
+        assert!(
+            !tracker.sessions_ended(),
+            "the log was read from its start, and that end is not ours to write down"
+        );
+        assert_eq!(
+            tracker.tie("Ordis"),
+            None,
+            "nor is the tie to it, which the run that watched it end wrote down"
+        );
+
+        feed(&mut tracker, CLIENT);
+        tracker.tie_squad(["Ordis"]);
+        assert!(!tracker.sessions_ended(), "this session goes on");
+        tracker.process_line("2200.000 Sys [Info]: EOM missionLocationUnlocked=1");
+
+        assert!(tracker.sessions_ended(), "and now it has ended");
+        assert!(!tracker.sessions_ended(), "told of once");
+        assert_eq!(
+            tracker
+                .tie("Ordis")
+                .map(|mission| mission.location.as_str()),
+            Some("SolNode6"),
+            "still tied, for the history to write them down"
+        );
+        tracker.untie("Ordis");
+        assert_eq!(tracker.tie("Ordis"), None, "and untied once it has");
+    }
+
+    #[test]
+    fn keeps_a_tie_to_the_session_a_replay_leaves_going_on() {
+        let mut tracker = MissionTracker::default();
+        feed(&mut tracker, HOST);
+        tracker.tie_squad(["Ordis"]);
+
+        assert!(!tracker.sessions_ended());
+        assert!(
+            tracker.tie("Ordis").is_some(),
+            "the session the replay ends inside of is ours to write down"
         );
     }
 
