@@ -7,7 +7,12 @@ mod loadout_window;
 use std::{
     env, fs,
     path::PathBuf,
-    sync::{Arc, atomic::Ordering, mpsc::Receiver},
+    process::Command,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::Receiver,
+    },
     thread,
     time::Duration,
 };
@@ -19,7 +24,8 @@ use eframe::egui::{
 };
 use loadout_window::LoadoutWindow;
 use warframe_peer_overlay::{
-    monitor::{self, MonitorSnapshot, PeerView, WindowRect},
+    lang::{self, text},
+    monitor::{self, MonitorSnapshot, PeerView, Status, WindowRect},
     notify,
     single_instance::SingleInstance,
     tray,
@@ -49,14 +55,14 @@ const MARQUEE_DWELL: f64 = 2.0;
 const MARQUEE_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 
 fn main() -> eframe::Result {
-    // Held for the whole process: dropping it would free the name for a second instance.
-    let Some(_instance) = SingleInstance::acquire("WarframePeerOverlay") else {
+    // Before anything is said to the user, the toast below included.
+    lang::set(lang::load());
+    // Held until the overlay closes: dropping it frees the name for a second instance,
+    // which is exactly what a restart for a new language needs.
+    let Some(instance) = SingleInstance::acquire("WarframePeerOverlay") else {
         // There is no console in a release build, so a toast is the only way to explain
         // why double-clicking the exe appeared to do nothing.
-        let _ = notify::show(
-            "Warframe Peer Overlay",
-            "すでに起動しています。終了するにはタスクトレイのアイコンからExitを選択してください。",
-        );
+        let _ = notify::show("Warframe Peer Overlay", text::already_running());
         // WinRT hands the toast to the notification platform asynchronously, so exiting
         // straight away drops it before it is ever delivered. The overlay is already
         // running, so a short pause here costs the user nothing.
@@ -65,6 +71,10 @@ fn main() -> eframe::Result {
     };
 
     let geo_enabled = !env::args().any(|argument| argument == "--no-geo");
+    // Raised by a language change, which closes the overlay rather than trying to re-lay
+    // every window under words of another width while they are on screen.
+    let restart = Arc::new(AtomicBool::new(false));
+    let restart_requested = Arc::clone(&restart);
     let options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
             .with_title("Warframe Peer Overlay")
@@ -77,7 +87,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "Warframe Peer Overlay",
         options,
         Box::new(move |context| {
@@ -109,6 +119,18 @@ fn main() -> eframe::Result {
                     tray::Command::ShowGridLoadouts => &show_grid_loadouts,
                     tray::Command::ShowHistory => &show_history,
                     tray::Command::ShowSession => &show_session,
+                    tray::Command::SetLanguage(language) => {
+                        // Picking the language already in force is no reason to restart.
+                        if language != lang::current() {
+                            lang::save(language);
+                            restart_requested.store(true, Ordering::Relaxed);
+                            egui_ctx.send_viewport_cmd_to(
+                                egui::ViewportId::ROOT,
+                                egui::ViewportCommand::Close,
+                            );
+                        }
+                        return;
+                    }
                     tray::Command::Exit => {
                         egui_ctx.send_viewport_cmd_to(
                             egui::ViewportId::ROOT,
@@ -133,7 +155,24 @@ fn main() -> eframe::Result {
                 startup_notice_pending: true,
             }))
         }),
-    )
+    );
+    // The new instance goes looking for the name as soon as it starts, and Windows keeps it
+    // reserved only while a handle to it is open.
+    drop(instance);
+    if restart.load(Ordering::Relaxed) {
+        relaunch();
+    }
+    result
+}
+
+/// Starts the overlay again with the arguments it was given, for a setting that is only read
+/// at launch. Failure is silent: the user is left with the overlay closed, and can start it
+/// again themselves.
+fn relaunch() {
+    let Ok(exe) = env::current_exe() else {
+        return;
+    };
+    let _ = Command::new(exe).args(env::args_os().skip(1)).spawn();
 }
 
 struct OverlayApp {
@@ -178,7 +217,7 @@ impl eframe::App for OverlayApp {
                 if !snapshot.warframe_running {
                     // The overlay window stays hidden until Warframe has a window, so a
                     // toast is the only feedback that the launch actually worked.
-                    let _ = notify::show("Warframe Peer Overlay", "Warframeの起動を待機中");
+                    let _ = notify::show("Warframe Peer Overlay", text::waiting_for_warframe());
                 }
             }
             self.cards = peer_cards(&snapshot.peers, self.geo_enabled);
@@ -242,7 +281,7 @@ impl eframe::App for OverlayApp {
         let monitoring = self
             .snapshot
             .as_ref()
-            .is_some_and(|snapshot| snapshot.status == "EE.logを監視中");
+            .is_some_and(|snapshot| snapshot.status == Status::Monitoring);
         if monitoring {
             if !self.cards.is_empty() {
                 show_compact_peer_panel(ui, &self.cards);
@@ -262,13 +301,11 @@ impl eframe::App for OverlayApp {
                 .snapshot
                 .as_ref()
                 .is_some_and(|snapshot| snapshot.warframe_running);
-            let header = header_job(
-                self.snapshot
-                    .as_ref()
-                    .map(|snapshot| snapshot.status.as_str())
-                    .unwrap_or("監視を開始しています"),
-                running,
+            let status = self.snapshot.as_ref().map_or_else(
+                || text::starting_up().to_owned(),
+                |snapshot| snapshot.status.to_string(),
             );
+            let header = header_job(&status, running);
             show_centered_job(ui, header);
             ui.add_space(2.0);
 
@@ -276,7 +313,7 @@ impl eframe::App for OverlayApp {
                 if snapshot.peers.is_empty() {
                     ui.vertical_centered(|ui| {
                         ui.label(
-                            RichText::new("分隊ピアを待機中")
+                            RichText::new(text::waiting_for_peers())
                                 .color(Color32::from_rgb(170, 178, 190)),
                         );
                     });
@@ -527,8 +564,8 @@ fn peer_second_line_job(peer: &PeerView, geo_enabled: bool) -> LayoutJob {
             (false, false) => format!("{}, {}", peer.region, peer.country),
             (true, false) => peer.country.clone(),
             (false, true) => peer.region.clone(),
-            _ if geo_enabled => "地域を解決中".to_owned(),
-            _ => "地域取得OFF".to_owned(),
+            _ if geo_enabled => text::resolving_location().to_owned(),
+            _ => text::geo_disabled().to_owned(),
         }
     };
     job.append(&location, 0.0, text_format(13.0, LOCATION_COLOR));

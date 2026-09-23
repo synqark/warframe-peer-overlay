@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    env,
+    env, fmt,
     fs::{self, File},
     io::{Read, Seek, SeekFrom},
     path::PathBuf,
@@ -25,6 +25,7 @@ use windows_sys::Win32::{
 use crate::{
     geo::{GeoInfo, GeoResolver, country_name},
     history::{History, HistoryEntry},
+    lang::text,
     loadout::{self, CaptureRequest, Captured, Job, Loadout, OwnRequest, RawJson, UpdateRequest},
     mission::{Mission, MissionTracker},
     parser::{LogParser, Peer},
@@ -75,11 +76,35 @@ pub struct LoadoutView {
     pub json: RawJson,
 }
 
+/// How the monitor is getting on, for the overlay's status line. An enum rather than the
+/// sentence itself so that the overlay can tell the one state it treats differently —
+/// watching the log, when it shows peer cards instead of the panel — without matching on
+/// wording that changes with the language.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Status {
+    WarframeNotRunning,
+    LogMissing,
+    Monitoring,
+    /// The log is there but could not be read; carries what went wrong.
+    ReadError(String),
+}
+
+impl fmt::Display for Status {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Status::WarframeNotRunning => formatter.write_str(text::status_waiting_for_warframe()),
+            Status::LogMissing => formatter.write_str(text::status_log_missing()),
+            Status::Monitoring => formatter.write_str(text::status_monitoring()),
+            Status::ReadError(error) => formatter.write_str(&text::status_read_error(error)),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MonitorSnapshot {
     pub warframe_running: bool,
     pub log_path: PathBuf,
-    pub status: String,
+    pub status: Status,
     pub peers: Vec<PeerView>,
     pub window_rect: Option<WindowRect>,
     /// The loadout window's cards: ours first, then each member still in the squad.
@@ -171,9 +196,9 @@ fn run(sender: Sender<MonitorSnapshot>, geo_enabled: bool) {
         // Whether a mission's session ended in what was read this time round.
         let mut session_ended = false;
         let status = if !running {
-            "Warframeを待機中".to_owned()
+            Status::WarframeNotRunning
         } else if !log_path.exists() {
-            "EE.logが見つかりません".to_owned()
+            Status::LogMissing
         } else {
             match read_appended_lines(
                 &log_path,
@@ -184,9 +209,9 @@ fn run(sender: Sender<MonitorSnapshot>, geo_enabled: bool) {
             ) {
                 Ok(()) => {
                     session_ended = missions.sessions_ended();
-                    "EE.logを監視中".to_owned()
+                    Status::Monitoring
                 }
-                Err(error) => format!("EE.log読み取りエラー: {error}"),
+                Err(error) => Status::ReadError(error.to_string()),
             }
         };
 
@@ -356,7 +381,7 @@ fn run(sender: Sender<MonitorSnapshot>, geo_enabled: bool) {
         let recent_missions = Vec::from(missions.missions().clone());
         let squad_ties = missions.squad_ties();
         let signature = format!(
-            "{running}:{status}:{peers:?}:{window_rect:?}:{loadout_cards:?}:{records}:{recent_missions:?}:{squad_ties:?}"
+            "{running}:{status:?}:{peers:?}:{window_rect:?}:{loadout_cards:?}:{records}:{recent_missions:?}:{squad_ties:?}"
         );
         if signature != last_signature {
             if sender

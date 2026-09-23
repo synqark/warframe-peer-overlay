@@ -1,5 +1,6 @@
 pub mod geo;
 pub mod history;
+pub mod lang;
 pub mod loadout;
 pub mod mission;
 pub mod monitor;

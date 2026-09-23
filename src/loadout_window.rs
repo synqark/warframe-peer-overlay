@@ -35,6 +35,7 @@ use jiff::civil::Date;
 use serde::{Deserialize, Serialize};
 use warframe_peer_overlay::{
     history::HistoryEntry,
+    lang::text,
     loadout::{Item, Loadout, Operator},
     mission::{Ending, Mission},
     monitor::LoadoutView,
@@ -151,7 +152,6 @@ const FLAG_SIZE: f32 = 13.0;
 /// and platform.
 const NAME_SIZE: f32 = 17.0;
 const HOST_SIZE: f32 = 13.0;
-const OWN_MARK: &str = "自分";
 const OWN_MARK_SIZE: f32 = 11.0;
 const STANDING_SIZE: f32 = 14.0;
 /// How much of the room it has a grid card's name is drawn at: a little under it, so that a
@@ -233,7 +233,7 @@ const GRID_COLUMN_GAP: f32 = 16.0;
 const GRID_PLACE_WIDTH: f32 = 160.0;
 const PLACE_SIZE: f32 = 13.0;
 /// What a grid card shows beneath its header, a row at a time: the column each of
-/// `GEAR_SLOTS` goes in, and `None` for the column of auras, operator and quests beside the
+/// `text::gear_slots` goes in, and `None` for the column of auras, operator and quests beside
 /// companion (`show_grid_extras`).
 const GRID_GEAR: [[Option<usize>; 2]; 3] =
     [[Some(0), Some(1)], [Some(2), Some(3)], [Some(4), None]];
@@ -248,14 +248,6 @@ const VACANT_STROKE: Color32 = Color32::from_rgb(52, 60, 72);
 const MOD_PATH: &str = "/Lotus/Upgrades/Mods/";
 const ARCANE_PATH: &str = "CosmeticEnhancers/";
 
-/// The equipment line's slots, in the order it shows them.
-const GEAR_SLOTS: [&str; 5] = [
-    "フレーム",
-    "プライマリ",
-    "セカンダリ",
-    "近接",
-    "コンパニオン",
-];
 /// The quests a loadout tells about, as `(short label, full name)`.
 const QUESTS: [(&str, &str); 2] = [("New War", "The New War"), ("Old Peace", "The Old Peace")];
 
@@ -266,7 +258,7 @@ enum Statistic {
     /// The country a player connected from; the region is not counted.
     Countries,
     Focus,
-    /// The gear in one of `GEAR_SLOTS`.
+    /// The gear in one of `text::gear_slots`.
     Slot(usize),
 }
 
@@ -633,7 +625,7 @@ fn show_cards(ui: &mut egui::Ui, shown: &mut Shown) {
     let header_widths = column_widths(cards.iter().map(|card| card.header.as_slice()));
     let gear_widths = column_widths(cards.iter().filter_map(|card| card.gear.as_deref()));
     let missing =
-        LayoutJob::single_section("ロードアウト未取得".to_owned(), scale.text(13.0, MUTED));
+        LayoutJob::single_section(text::loadout_missing().to_owned(), scale.text(13.0, MUTED));
 
     Frame::new()
         .fill(BACKGROUND)
@@ -676,7 +668,7 @@ fn lay_out(ui: &egui::Ui, row: &LoadoutView, scale: Scale) -> Card {
     };
     let header = header(row, scale).into_iter().map(cell).collect();
     let gear = row.loadout.as_ref().map(|loadout| {
-        GEAR_SLOTS
+        text::gear_slots()
             .into_iter()
             .zip(gear(loadout))
             .map(|(slot, (value, details))| cell((slot_job(slot, &value, scale), details)))
@@ -704,7 +696,7 @@ fn lay_out(ui: &egui::Ui, row: &LoadoutView, scale: Scale) -> Card {
 fn header(row: &LoadoutView, scale: Scale) -> Vec<(LayoutJob, Option<String>)> {
     let mut name = name_job(row, scale);
     if row.is_local && !row.name.is_empty() {
-        name.append(OWN_MARK, scale.px(8.0), scale.text(OWN_MARK_SIZE, MUTED));
+        name.append(text::you(), scale.px(8.0), scale.text(OWN_MARK_SIZE, MUTED));
     }
     let mut header = vec![
         (name, None),
@@ -728,7 +720,7 @@ fn grid_name_job(row: &LoadoutView, room: f32, scale: Scale) -> LayoutJob {
 fn name_job_at(row: &LoadoutView, size: f32, scale: Scale) -> LayoutJob {
     let color = if row.is_local { GOLD_TEXT } else { TEXT };
     let name = if row.name.is_empty() {
-        "自分"
+        text::you()
     } else {
         &row.name
     };
@@ -737,7 +729,7 @@ fn name_job_at(row: &LoadoutView, size: f32, scale: Scale) -> LayoutJob {
 
 /// The mark that a card is ours, for a layout that keeps it apart from the name.
 fn own_mark(scale: Scale) -> LayoutJob {
-    single(OWN_MARK, OWN_MARK_SIZE, MUTED, scale)
+    single(text::you(), OWN_MARK_SIZE, MUTED, scale)
 }
 
 fn mastery_job(row: &LoadoutView, scale: Scale) -> LayoutJob {
@@ -786,9 +778,9 @@ fn quest_jobs(row: &LoadoutView, scale: Scale) -> Vec<(LayoutJob, Option<String>
                 format!(
                     "{quest}: {}",
                     if done {
-                        "クリア済み"
+                        text::quest_done()
                     } else {
-                        "未クリア"
+                        text::quest_not_done()
                     }
                 )
             });
@@ -801,7 +793,7 @@ fn single(text: &str, size: f32, color: Color32, scale: Scale) -> LayoutJob {
     LayoutJob::single_section(text.to_owned(), scale.text(size, color))
 }
 
-/// A slot and what fills it, as `フレーム Volt Prime`.
+/// A slot and what fills it, as `フレーム Volt Prime`, or `Warframe Volt Prime` in English.
 fn slot_job(slot: &str, value: &str, scale: Scale) -> LayoutJob {
     let mut job = LayoutJob::default();
     job.append(slot, 0.0, scale.text(12.0, MUTED));
@@ -1030,7 +1022,7 @@ fn show_grid_card_contents(ui: &mut egui::Ui, row: &LoadoutView, scale: Scale) {
     ui.spacing_mut().item_spacing = egui::vec2(scale.px(8.0), scale.px(3.0));
     show_grid_header(ui, row, scale);
     let Some(loadout) = &row.loadout else {
-        ui.label(single("ロードアウト未取得", 13.0, MUTED, scale));
+        ui.label(single(text::loadout_missing(), 13.0, MUTED, scale));
         return;
     };
     let mut gear = gear(loadout);
@@ -1044,7 +1036,8 @@ fn show_grid_card_contents(ui: &mut egui::Ui, row: &LoadoutView, scale: Scale) {
                 match slot {
                     Some(slot) => {
                         let (value, details) = std::mem::take(&mut gear[slot]);
-                        show_full_slot(column, GEAR_SLOTS[slot], &value, details, scale);
+                        let slot_name = text::gear_slots()[slot];
+                        show_full_slot(column, slot_name, &value, details, scale);
                         show_full_mods(column, items[slot], MOD_ROWS[slot], scale);
                     }
                     None => show_grid_extras(column, row, loadout, scale),
@@ -1064,7 +1057,8 @@ fn show_vacant_place(ui: &egui::Ui, rect: egui::Rect, scale: Scale) {
         Stroke::new(scale.px(1.0).max(1.0), VACANT_STROKE),
         StrokeKind::Inside,
     );
-    let label = ui.fonts_mut(|fonts| fonts.layout_job(single("未参加", 16.0, MUTED, scale)));
+    let vacant = single(text::vacant_place(), 16.0, MUTED, scale);
+    let label = ui.fonts_mut(|fonts| fonts.layout_job(vacant));
     painter.galley(rect.center() - label.size() / 2.0, label, MUTED);
 }
 
@@ -1210,11 +1204,15 @@ fn show_scope(ui: &mut egui::Ui, scope: &mut Scope, scale: Scale) {
         ui.selectable_value(
             scope,
             Scope::Listed,
-            single("検索データのみ", 12.0, TEXT, scale),
+            single(text::scope_listed(), 12.0, TEXT, scale),
         );
-        ui.selectable_value(scope, Scope::All, single("全データ", 12.0, TEXT, scale));
+        ui.selectable_value(
+            scope,
+            Scope::All,
+            single(text::scope_all(), 12.0, TEXT, scale),
+        );
         ui.add_space(scale.px(4.0));
-        ui.label(single("統計表示対象データ：", 12.0, MUTED, scale));
+        ui.label(single(text::scope_label(), 12.0, MUTED, scale));
     });
 }
 
@@ -1237,24 +1235,28 @@ fn show_session(ui: &mut egui::Ui, shown: &mut Shown) {
                 ui.label(single(text, 13.0, MUTED, scale));
             };
 
-            heading(ui, "最後にロードしたミッション");
+            heading(ui, text::session_latest());
             match shown.missions.last() {
                 Some(latest) => show_latest_mission(ui, latest, scale),
-                None => note(ui, "まだ SolNode のミッションのロードを見ていません。"),
+                None => note(ui, text::session_no_missions()),
             }
             ui.add_space(scale.px(6.0));
             ui.separator();
 
-            heading(ui, "分隊メンバーの紐付け（抜けたときに History へ記録）");
+            heading(ui, text::session_ties());
             if shown.squad_ties.is_empty() {
-                note(ui, "分隊にメンバーはいません。");
+                note(ui, text::session_no_members());
             } else {
                 egui::Grid::new("session-ties")
                     .striped(true)
                     .spacing(egui::vec2(scale.px(20.0), scale.px(3.0)))
                     .show(ui, |ui| {
-                        for column in ["メンバー", "location", "missionType", "ロード (秒)"]
-                        {
+                        for column in [
+                            text::column_member(),
+                            "location",
+                            "missionType",
+                            text::column_loaded(),
+                        ] {
                             ui.label(single(column, 12.0, MUTED, scale));
                         }
                         ui.end_row();
@@ -1272,7 +1274,7 @@ fn show_session(ui: &mut egui::Ui, shown: &mut Shown) {
                                 }
                                 None => {
                                     ui.label(single(
-                                        "なし（抜けても記録しない）",
+                                        text::session_tie_none(),
                                         13.0,
                                         HOST_COLOR,
                                         scale,
@@ -1286,7 +1288,7 @@ fn show_session(ui: &mut egui::Ui, shown: &mut Shown) {
             ui.add_space(scale.px(6.0));
             ui.separator();
 
-            heading(ui, "直近のミッション（新しい順）");
+            heading(ui, text::session_recent());
             ScrollArea::both()
                 .id_salt("session-recent")
                 .auto_shrink(false)
@@ -1296,12 +1298,12 @@ fn show_session(ui: &mut egui::Ui, shown: &mut Shown) {
                         .spacing(egui::vec2(scale.px(20.0), scale.px(3.0)))
                         .show(ui, |ui| {
                             for column in [
-                                "ロード (秒)",
-                                "役割",
+                                text::column_loaded(),
+                                text::column_role(),
                                 "location",
                                 "missionType",
-                                "ノード",
-                                "終了",
+                                text::column_node(),
+                                text::column_ended(),
                             ] {
                                 ui.label(single(column, 12.0, MUTED, scale));
                             }
@@ -1345,13 +1347,13 @@ fn show_latest_mission(ui: &mut egui::Ui, latest: &Mission, scale: Scale) {
                     ),
                     TEXT,
                 ),
-                ("ノード", or_dash(&latest.node), TEXT),
+                (text::column_node(), or_dash(&latest.node), TEXT),
                 (
-                    "ロード",
-                    format!("{} 秒 ({})", latest.loaded_at, mission_role(latest)),
+                    text::label_loaded(),
+                    text::loaded_seconds(&latest.loaded_at, mission_role(latest)),
                     TEXT,
                 ),
-                ("セッション終了", ended, ended_colour),
+                (text::label_session_ended(), ended, ended_colour),
             ] {
                 ui.label(single(label, 12.0, MUTED, scale));
                 ui.label(single(&value, 16.0, colour, scale));
@@ -1363,9 +1365,9 @@ fn show_latest_mission(ui: &mut egui::Ui, latest: &Mission, scale: Scale) {
 /// Whether we loaded the mission as its host or joined it.
 fn mission_role(mission: &Mission) -> &'static str {
     if mission.host {
-        "ホスト"
+        text::role_host()
     } else {
-        "クライアント"
+        text::role_client()
     }
 }
 
@@ -1378,9 +1380,9 @@ fn mission_end(mission: &Mission) -> (String, Color32) {
                 Ending::Eom => "EOM",
                 Ending::Abort => "Abort",
             };
-            (format!("済 ({by} {} 秒)", ended.at), QUEST_DONE)
+            (text::ended_by(by, &ended.at), QUEST_DONE)
         }
-        None => ("未".to_owned(), HOST_COLOR),
+        None => (text::not_ended().to_owned(), HOST_COLOR),
     }
 }
 
@@ -1416,12 +1418,7 @@ fn show_history_list<'a>(
     scale: Scale,
 ) -> Option<&'a HistoryEntry> {
     if history.is_empty() {
-        ui.label(single(
-            "まだ記録がありません。分隊のメンバーが抜けたときに記録します。",
-            13.0,
-            MUTED,
-            scale,
-        ));
+        ui.label(single(text::history_empty(), 13.0, MUTED, scale));
         return None;
     }
     refresh_listed(shown, history);
@@ -1430,13 +1427,13 @@ fn show_history_list<'a>(
         .as_ref()
         .map_or(&[][..], |(_, _, listed)| listed.as_slice());
     let count = if shown.filter.is_empty() {
-        format!("{}件", history.len())
+        text::record_count(history.len())
     } else {
-        format!("{} / {}件", listed.len(), history.len())
+        text::record_count_listed(listed.len(), history.len())
     };
     ui.label(single(&count, 12.0, MUTED, scale));
     if listed.is_empty() {
-        ui.label(single("条件に合う記録がありません。", 13.0, MUTED, scale));
+        ui.label(single(text::history_no_matches(), 13.0, MUTED, scale));
         return None;
     }
     let row = ui.fonts_mut(|fonts| fonts.layout_job(single("M", 14.0, TEXT, scale)).size().y)
@@ -1478,7 +1475,7 @@ fn show_history_header(
     show_list_filters(&mut line, filter, scale);
     show_dates(&mut line, filter, scale);
     line.add_space(scale.px(4.0));
-    let clear = egui::Button::new(single("絞り込み解除", 12.0, TEXT, scale));
+    let clear = egui::Button::new(single(text::clear_filters(), 12.0, TEXT, scale));
     if line.add_enabled(!filter.is_empty(), clear).clicked() {
         *filter = Filter::default();
     }
@@ -1497,7 +1494,7 @@ fn show_list_filters(ui: &mut egui::Ui, filter: &mut Filter, scale: Scale) {
         ui,
         &mut filter.name,
         "history-name",
-        "名前で検索",
+        text::search_by_name(),
         who,
         scale,
     );
@@ -1506,7 +1503,7 @@ fn show_list_filters(ui: &mut egui::Ui, filter: &mut Filter, scale: Scale) {
         ui,
         &mut filter.node,
         "history-node",
-        "ノードで検索",
+        text::search_by_node(),
         node,
         scale,
     );
@@ -1516,9 +1513,15 @@ fn show_list_filters(ui: &mut egui::Ui, filter: &mut Filter, scale: Scale) {
 /// The two dates between which the list keeps a match, both of them part of the range and
 /// neither set to begin with.
 fn show_dates(ui: &mut egui::Ui, filter: &mut Filter, scale: Scale) {
-    show_date(ui, &mut filter.from, "開始日", "history-from", scale);
-    ui.label(single("〜", 12.0, MUTED, scale));
-    show_date(ui, &mut filter.to, "終了日", "history-to", scale);
+    show_date(
+        ui,
+        &mut filter.from,
+        text::date_from(),
+        "history-from",
+        scale,
+    );
+    ui.label(single(text::date_range(), 12.0, MUTED, scale));
+    show_date(ui, &mut filter.to, text::date_to(), "history-to", scale);
 }
 
 /// One end of the range: a button opening a calendar to pick a date from (`egui_extras`),
@@ -1545,7 +1548,7 @@ fn show_date(
         let cross = egui::Button::new(single("×", 12.0, MUTED, scale));
         if ui
             .add(cross)
-            .on_hover_text(format!("{which}を外す"))
+            .on_hover_text(text::clear_date(which))
             .clicked()
         {
             *bound = None;
@@ -1588,7 +1591,7 @@ fn mission_type_menu(ui: &mut egui::Ui, picked: &mut Option<String>, scale: Scal
             TEXT,
             scale,
         ),
-        None => single("タイプ", 13.0, MUTED, scale),
+        None => single(text::mission_type_any(), 13.0, MUTED, scale),
     };
     // Held to the column's width, which a long name is cut short to rather than widen it.
     ui.allocate_ui_with_layout(
@@ -1603,7 +1606,8 @@ fn mission_type_menu(ui: &mut egui::Ui, picked: &mut Option<String>, scale: Scal
                 .selected_text(selected)
                 .show_ui(ui, |ui| {
                     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                    ui.selectable_value(picked, None, single("すべて", 13.0, MUTED, scale));
+                    let any = single(text::filter_all(), 13.0, MUTED, scale);
+                    ui.selectable_value(picked, None, any);
                     for (id, name) in names::mission_types() {
                         let option = single(name, 13.0, TEXT, scale);
                         ui.selectable_value(picked, Some((*id).to_owned()), option);
@@ -1721,12 +1725,12 @@ fn show_pie(
     show_cell_title(
         ui,
         statistic.title(),
-        &format!("{}人", counted.players),
+        &text::player_count(counted.players),
         scale,
     );
     let shares = &counted.shares;
     if counted.players == 0 {
-        ui.label(single("記録なし", 13.0, MUTED, scale));
+        ui.label(single(text::no_records(), 13.0, MUTED, scale));
         return;
     }
     let colours = shares
@@ -1758,9 +1762,9 @@ fn show_pie(
         let response = response
             .on_hover_cursor(egui::CursorIcon::PointingHand)
             .on_hover_text_at_pointer(format!(
-                "{}\n{}人 ({})",
+                "{}\n{} ({})",
                 share.label,
-                share.count,
+                text::player_count(share.count),
                 percent(share.count, counted.players)
             ));
         if response.clicked() {
@@ -1856,12 +1860,12 @@ fn show_ranking(
 ) {
     let shares = &counted.shares;
     let note = match statistic {
-        Statistic::Countries => format!("{}か国", shares.len()),
-        _ => format!("{}種", shares.len()),
+        Statistic::Countries => text::country_count(shares.len()),
+        _ => text::kind_count(shares.len()),
     };
     show_cell_title(ui, statistic.title(), &note, scale);
     let Some(first) = shares.first() else {
-        ui.label(single("記録なし", 13.0, MUTED, scale));
+        ui.label(single(text::no_records(), 13.0, MUTED, scale));
         return;
     };
     let most = first.count as f32;
@@ -2098,10 +2102,10 @@ impl Statistic {
 
     fn title(self) -> &'static str {
         match self {
-            Statistic::Platforms => "プラットフォーム",
-            Statistic::Countries => "国",
-            Statistic::Focus => "フォーカス",
-            Statistic::Slot(slot) => GEAR_SLOTS[slot],
+            Statistic::Platforms => text::statistic_platforms(),
+            Statistic::Countries => text::statistic_countries(),
+            Statistic::Focus => text::statistic_focus(),
+            Statistic::Slot(slot) => text::gear_slots()[slot],
         }
     }
 
@@ -2359,10 +2363,10 @@ fn show_full_card(ui: &mut egui::Ui, row: &LoadoutView, scale: Scale) {
                 show_full_status(ui, row, scale);
                 show_full_location(ui, row, scale);
                 let Some(loadout) = &row.loadout else {
-                    ui.label(single("ロードアウト未取得", 13.0, MUTED, scale));
+                    ui.label(single(text::loadout_missing(), 13.0, MUTED, scale));
                     return;
                 };
-                let slots = GEAR_SLOTS
+                let slots = text::gear_slots()
                     .into_iter()
                     .zip(gear(loadout))
                     .zip(items(loadout))
@@ -2456,7 +2460,7 @@ fn show_grid_header(ui: &mut egui::Ui, row: &LoadoutView, scale: Scale) {
     let height = |text: &str, size: f32| {
         ui.fonts_mut(|fonts| fonts.layout_job(single(text, size, TEXT, scale)).size().y)
     };
-    let marks = height("HOST", HOST_SIZE).max(height(OWN_MARK, OWN_MARK_SIZE));
+    let marks = height("HOST", HOST_SIZE).max(height(text::you(), OWN_MARK_SIZE));
     let standing = height("M", STANDING_SIZE);
     // Text stands about as tall as its size, so the size that makes a line `tall` is found
     // from how tall a line comes out at the header's usual one.
@@ -2554,7 +2558,7 @@ fn show_grid_extras(ui: &mut egui::Ui, row: &LoadoutView, loadout: &Loadout, sca
     let auras = auras(loadout);
     let any_auras = !auras.is_empty();
     for (index, (name, details)) in auras.into_iter().enumerate() {
-        let label = if index == 0 { "オーラ" } else { "" };
+        let label = if index == 0 { text::slot_aura() } else { "" };
         show_full_slot(ui, label, name, Some(details), scale);
     }
     if let Some(operator) = &loadout.operator {
@@ -2583,9 +2587,9 @@ fn auras(loadout: &Loadout) -> Vec<(&str, String)> {
 /// Who stands behind the warframe, as the label the line goes by.
 fn operator_label(operator: &Operator) -> &'static str {
     if operator.drifter {
-        "漂流者"
+        text::drifter()
     } else {
-        "オペレーター"
+        text::operator()
     }
 }
 
@@ -2729,7 +2733,7 @@ fn mods(item: &Item) -> Vec<(&str, &str)> {
         .collect()
 }
 
-/// What fills each of `GEAR_SLOTS`, in that order.
+/// What fills each of `text::gear_slots`, in that order.
 fn items(loadout: &Loadout) -> [&Option<Item>; 5] {
     [
         &loadout.warframe,
@@ -2775,13 +2779,10 @@ fn item_details(item: &Item) -> String {
             .collect::<Vec<_>>();
         lines.push(parts.join(" / "));
     }
-    let stats = [
-        item.rank.map(|rank| format!("ランク {rank}")),
-        item.forma.map(|forma| format!("フォーマ {forma}")),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
+    let stats = [item.rank.map(text::rank), item.forma.map(text::forma)]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
     if !stats.is_empty() {
         lines.push(stats.join(" / "));
     }
@@ -3213,7 +3214,10 @@ mod tests {
         assert_eq!(item_label(&zaw), "Dokrahm");
         assert_eq!(
             item_details(&zaw),
-            "Dokrahm\n/Lotus/Weapons/Ostron/Melee/LotusModularWeapon\nVargeet Jai II / Korb / Dokrahm\nランク 30"
+            format!(
+                "Dokrahm\n/Lotus/Weapons/Ostron/Melee/LotusModularWeapon\nVargeet Jai II / Korb / Dokrahm\n{}",
+                text::rank(30)
+            )
         );
     }
 
@@ -3223,7 +3227,11 @@ mod tests {
         assert_eq!(item_label(&suit), "ExampleSuit");
         assert_eq!(
             item_details(&suit),
-            "ExampleSuit\n/Example/Suits/ExampleSuit\nランク 30 / フォーマ 2"
+            format!(
+                "ExampleSuit\n/Example/Suits/ExampleSuit\n{} / {}",
+                text::rank(30),
+                text::forma(2)
+            )
         );
 
         let bare = item("/Example/Rifle", None, None).unwrap();
@@ -3340,7 +3348,7 @@ mod tests {
             drifter: true,
             focus: Some("/Lotus/Upgrades/Focus/Power/PowerFocusAbility".to_owned()),
         };
-        assert_eq!(operator_label(&drifter), "漂流者");
+        assert_eq!(operator_label(&drifter), text::drifter());
         assert_eq!(
             focus(&drifter),
             (
@@ -3353,7 +3361,7 @@ mod tests {
             drifter: false,
             focus: None,
         };
-        assert_eq!(operator_label(&operator), "オペレーター");
+        assert_eq!(operator_label(&operator), text::operator());
         assert_eq!(focus(&operator), ("—".to_owned(), None));
     }
 
@@ -3376,7 +3384,7 @@ mod tests {
             .flatten()
             .collect::<Vec<_>>();
         slots.sort_unstable();
-        assert_eq!(slots, (0..GEAR_SLOTS.len()).collect::<Vec<_>>());
+        assert_eq!(slots, (0..text::gear_slots().len()).collect::<Vec<_>>());
     }
 
     #[test]
